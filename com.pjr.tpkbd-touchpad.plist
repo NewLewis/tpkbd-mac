@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- 安装: 把下面 ProgramArguments 的路径改成你编译出的 tpkbd_touchpad 绝对路径,
+	     然后: launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.pjr.tpkbd-touchpad.plist -->
+	<key>Label</key>
+	<string>com.pjr.tpkbd-touchpad</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/path/to/tpkbd-mac/tpkbd_touchpad</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/tmp/tpkbd.log</string>
+	<key>StandardOutPath</key>
+	<string>/tmp/tpkbd.log</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<!-- 调参全在这里, 改完 bootout+bootstrap 生效, 不用重编译 -->
+		<key>TPKB_MOVE_GAIN</key>
+		<string>1.8</string>
+		<key>TPKB_SCROLL_GAIN</key>
+		<string>2.2</string>
+		<key>TPKB_SCROLL_NATURAL</key>
+		<string>1</string>
+		<key>TPKB_TAP</key>
+		<string>session</string>
+		<key>TPKB_DEBUG</key>
+		<string>0</string>
+	</dict>
+</dict>
+</plist>

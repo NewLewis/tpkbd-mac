@@ -1,0 +1,8 @@
+# 编译产物
+tpkbd_touchpad
+tap_cap
+postsc
+*.o
+
+# 系统杂物
+.DS_Store
