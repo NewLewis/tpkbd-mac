@@ -94,6 +94,7 @@ See [docs/devlog.md](docs/devlog.md) for the full reverse-engineering story, inc
 - **`IOHIDDeviceOpen` returns `0xe00002e2`** → Input Monitoring permission missing.
 - **Rebuilt the binary, behavior unchanged** → launchd still runs the old image: `launchctl kickstart -k gui/$(id -u)/com.pjr.tpkbd-touchpad`.
 - **Permissions lost after rebuild** → you're ad-hoc signing; create the `tpkbd-sign` cert (see Install).
+- **Permissions lost after moving the binary** → TCC grants are bound to the binary's **absolute path** as well as its signing identity. Deploy the daemon to a stable path once (e.g. `TPKB_INSTALL_DIR="$HOME/Library/Application Support/tpkbd-mac" ./build.sh`) and point the LaunchAgent there, so reorganizing your source tree never breaks the grants again.
 - Logs: `tail -f /tmp/tpkbd.log` (set `TPKB_DEBUG=1` for full report dumps).
 
 ## Limitations

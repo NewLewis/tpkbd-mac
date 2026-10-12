@@ -94,6 +94,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.pjr.tpkbd-touchpad.p
 - **`IOHIDDeviceOpen` 返回 `0xe00002e2`** → 缺输入监控权限。
 - **重编译后行为没变** → launchd 还在跑旧二进制：`launchctl kickstart -k gui/$(id -u)/com.pjr.tpkbd-touchpad`。
 - **重编译后授权失效** → 在用 ad-hoc 签名；按安装一节创建 `tpkbd-sign` 证书。
+- **移动二进制后授权失效** → TCC 授权同时绑定签名身份和二进制的**绝对路径**。建议把守护进程一次性部署到稳定路径（如 `TPKB_INSTALL_DIR="$HOME/Library/Application Support/tpkbd-mac" ./build.sh`）、LaunchAgent 指向那里，之后随便整理源码目录都不会再断授权。
 - 日志：`tail -f /tmp/tpkbd.log`（`TPKB_DEBUG=1` 可看全量报文转储）。
 
 ## 已知限制
