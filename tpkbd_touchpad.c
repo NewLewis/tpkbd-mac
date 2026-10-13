@@ -81,8 +81,9 @@ static int seq_counter          = 0;
 
 // ---- 光标状态 ----
 static int have_last = 0;
-static int last_px = 0, last_py = 0;    // 主指上次 pad 坐标
-static int last_sx = 0, last_sy = 0;    // 主指上次对应的光标屏幕坐标
+static int last_px = 0, last_py = 0;    // 跟踪指上次 pad 坐标
+static int last_sx = 0, last_sy = 0;    // 跟踪指上次对应的光标屏幕坐标
+static int move_slot = -1;              // 当前跟随的指槽; 换跟指时重新锚定不跳变
 static int scroll_active = 0;
 static int last_cx = 0, last_cy = 0;    // 两指质心上次 pad 坐标
 static int btn_prev = 0;
@@ -297,6 +298,12 @@ static CGEventRef key_tap_cb(CGEventTapProxy proxy, CGEventType type,
 // 按住左键时的拖动(框选/拖拽必须用 Dragged 事件, 用 Moved 系统不认为在拖)
 static void post_mouse_drag(CGPoint p) {
     CGEventRef e = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseDragged, p, kCGMouseButtonLeft);
+    if (e) { CGEventPost(g_tap, e); CFRelease(e); }
+}
+
+// 按住右键时的拖动(双指按压后移动 = 右键拖移, 同原生触控板)
+static void post_right_drag(CGPoint p) {
+    CGEventRef e = CGEventCreateMouseEvent(NULL, kCGEventRightMouseDragged, p, kCGMouseButtonRight);
     if (e) { CGEventPost(g_tap, e); CFRelease(e); }
 }
 
@@ -885,13 +892,9 @@ static void handle_report(uint32_t cb_rid, uint8_t *r, CFIndex len) {
     // 三指手势收尾(抬指/降为双指): 三指在板期间不发移动/滚动
     if (swipe3_active && (ntips < 3 || !swipe3_on)) swipe3_end();
 
-    if (ntips >= 3 && swipe3_on && !swallow) {
+    if (ntips >= 3 && swipe3_on && !swallow && !btn_prev) {
         // ---- 三指: 左右滑切换全屏应用/桌面空间 (dock swipe) ----
-        if (btn_prev) {  // 三指在板不点击: 强制抬起当前按住的键(左/右)
-            if (btn_type) post_right_click(cur, 0, 1);
-            else          post_click(cur, 0, click_count);
-            btn_prev = 0;
-        }
+        // 物理按住期间不进此分支: 按住时一切触摸都是拖移(同原生触控板)。
         // 质心 = 最早按下的最多三个指尖
         int pick[NFINGER], npick = 0, c3x = 0, c3y = 0;
         for (int rank = 0; rank < 3; rank++) {
@@ -949,8 +952,9 @@ static void handle_report(uint32_t cb_rid, uint8_t *r, CFIndex len) {
         }
         tap_active = 0; tap_nfid = 0; tap_moved = 0;
         type_grandf = 0;   // 在板手势结束, 后续新触摸按锁定规则处理
-    } else if (ntips >= 2 && !swallow) {
+    } else if (ntips >= 2 && !swallow && !btn_prev) {
         // ---- 两指滚动: 用最早按下的两个活跃槽位的质心 ----
+        // (物理按住期间让位给拖移, 不滚动)
         int s1 = -1, s2 = -1;
         for (int k = 0; k < 2; k++) {
             int best = -1, best_seq = 0x7fffffff;
@@ -993,17 +997,21 @@ static void handle_report(uint32_t cb_rid, uint8_t *r, CFIndex len) {
             have_last = 0;  // 滚动结束后光标重新锚定
         }
     } else if (!swallow) {
-        // ---- 单指移动: 绝对坐标差分 × 增益 ----
+        // ---- 指针移动: 差分 × 增益 ----
+        // 未按住 = 单指移动; 物理按住期间 = 拖移(滚动/三指分支已让位)。
+        // 指针始终跟随最新落下的手指 — 原生触控板的"换指拖移": 按住后
+        // 另一指接管指针(选中长文本就靠它), 换跟指当帧只锚定不跳动。
         if (scroll_active) end_scroll_gesture();   // 双指变单指: 手势收尾
         scroll_active = 0;
-        int s = -1;
-        for (int i = 0; i < NFINGER; i++) if (tips[i]) { s = i; break; }
+        int s = -1, sseq = 0;
+        for (int i = 0; i < NFINGER; i++)
+            if (tips[i] && down_seq[i] > sseq) { sseq = down_seq[i]; s = i; }
         if (s >= 0) {
-            if (down_seq[s] > 0 && (!have_last)) {
-                // 新按下: 仅锚定, 不跳动
+            if (!have_last || move_slot != s) {
+                // 新按下/换跟踪指: 仅锚定, 不跳动
                 if (debug) fprintf(stderr, "[tpkbd] MV anchor slot=%d pad=(%d,%d) cur=(%.0f,%.0f)\n",
                                    s, fx[s], fy[s], cur.x, cur.y);
-            } else if (have_last) {
+            } else {
                 int nx = last_sx + (int)((fx[s] - last_px) * move_gain);
                 int ny = last_sy + (int)((fy[s] - last_py) * move_gain);
                 if (debug) fprintf(stderr, "[tpkbd] MV slot=%d pad=(%d,%d) last=(%d,%d) d=(%d,%d) -> (%d,%d)\n",
@@ -1014,10 +1022,15 @@ static void handle_report(uint32_t cb_rid, uint8_t *r, CFIndex len) {
                 // 按住期间必须发 Dragged 而非 Moved: 按下时板面下沉, 触点
                 // 天然有微小位移, 若在 Down/Up 之间插入 Moved, App 的点击
                 // 跟踪会取消该次点击(表现为"点按偶尔不灵")。
-                if (btn_prev) post_mouse_drag(CGPointMake(nx, ny));
-                else          post_mouse_move(CGPointMake(nx, ny));
+                if (btn_prev) {
+                    if (btn_type) post_right_drag(CGPointMake(nx, ny));
+                    else          post_mouse_drag(CGPointMake(nx, ny));
+                } else {
+                    post_mouse_move(CGPointMake(nx, ny));
+                }
                 cur.x = nx; cur.y = ny;
             }
+            move_slot = s;
             last_px = fx[s]; last_py = fy[s];
             last_sx = (int)cur.x; last_sy = (int)cur.y;
             have_last = 1;

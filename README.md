@@ -16,6 +16,7 @@ It turns out the touchpad also implements the **standard HID multitouch digitize
 |---|---|---|
 | 1-finger move | Pointer | Speed via `TPKB_MOVE_GAIN`; cursor can cross into external displays |
 | 1-finger physical press | Left click | 5-frame debounce, proper double/triple-click counts |
+| Button held + finger move | Drag / text selection | While pressed, all touch becomes drag — scrolling and gestures yield; pointer follows the newest finger (finger-walking) |
 | 1-finger tap | Left click | <250 ms and <10 counts of travel; supports double/triple tap |
 | 2-finger move | Smooth scrolling | Gesture-phase event stream — apps treat it like a real trackpad, not a mouse wheel |
 | 2-finger flick | Momentum scrolling | Physics curve ported from Mac Mouse Fix's trackpad-like defaults |
