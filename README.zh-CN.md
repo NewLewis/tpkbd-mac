@@ -20,7 +20,7 @@ ThinkPad X1 Tablet Thin Keyboard Gen 3（Chicony 代工，USB VID `17ef` PID `60
 | 单指轻点 | 左键 | <250ms 且位移 <10 counts 才算点；支持双击/三击连击 |
 | 双指移动 | 丝滑滚动 | 手势相位事件流——App 把它当真触控板而非鼠标滚轮 |
 | 双指甩动 | 惯性滚动 | 移植 Mac Mouse Fix 的触控板物理曲线 |
-| 双指轻点 / 双指按压 | 右键 | 产生过滚动即作废，轻蹭不误弹菜单 |
+| 双指按压 | 右键 | 双指轻点=右键默认关（易误触），`TPKB_TAP_RIGHT=1` 可打开 |
 | 三指左右滑 | 切换桌面空间 / 全屏应用 | 跟手、回拉取消、按空间数自适应缩放 |
 | 三指上滑 / 下滑 | 调度中心 / App Exposé | |
 | 打字中 | 触摸板锁定 500ms | libinput 式 disable-while-typing；在板手势放行、按住的键不卡死 |
@@ -71,6 +71,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.pjr.tpkbd-touchpad.p
 | `TPKB_SCROLL_GAIN` | 2.2 | 滚动速度倍率 |
 | `TPKB_SCROLL_NATURAL` | 1 | 1=自然滚动 |
 | `TPKB_TAPCLICK` | 1 | 轻点点按 |
+| `TPKB_TAP_RIGHT` | 0 | 双指轻点=右键（默认关；双指物理按压始终是右键） |
 | `TPKB_TAP_MS` | 250 | 轻点最长时长(ms) |
 | `TPKB_SWIPE3` | 1 | 三指手势 |
 | `TPKB_SWIPE3_GAIN` | 1.0 | 三指滑动速度 |

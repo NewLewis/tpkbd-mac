@@ -250,9 +250,10 @@ static int click_count_for(CGPoint pos) {
 }
 
 // ---- 轻点点按 & 双指右键 ----
-// 轻点 = 短触摸(<TPKB_TAP_MS) + 位移小 + 未产生滚动像素; 指数为 1 → 左键, 2 → 右键。
-// 双指物理按压同样路由为右键(单指按压仍为左键)。
+// 轻点 = 短触摸(<TPKB_TAP_MS) + 位移小 + 未产生滚动像素; 单指轻点 → 左键。
+// 双指轻点 → 右键默认关(易误触, TPKB_TAP_RIGHT=1 打开); 双指物理按压始终是右键。
 static int      tap_on = 1;            // TPKB_TAPCLICK
+static int      tap_right_on = 0;      // TPKB_TAP_RIGHT: 双指轻点=右键(默认关)
 static int      tap_ms_thresh = 250;   // TPKB_TAP_MS
 static int      tap_nfid = 0;          // 本轮触摸的峰值指数
 static int      tap_moved = 0;         // 主指位移超阈值
@@ -936,7 +937,7 @@ static void handle_report(uint32_t cb_rid, uint8_t *r, CFIndex len) {
         // 双指滚动哪怕只滚了 1px(gesture_state 到过 2), 两指轻点即作废,
         // 否则轻蹭一下就会弹右键菜单。
         if (tap_active && tap_on && btn_prev == 0 &&
-            (tap_nfid == 1 || tap_nfid == 2) && !tap_moved &&
+            (tap_nfid == 1 || (tap_nfid == 2 && tap_right_on)) && !tap_moved &&
             !tap_scrolled &&
             now_ms() - tap_down_ms < (uint64_t)tap_ms_thresh) {
             if (tap_nfid == 1) {
@@ -1217,6 +1218,7 @@ int main(int argc, char **argv) {
     if ((env = getenv("TPKB_SWIPE3"))        != NULL) swipe3_on   = atoi(env);
     if ((env = getenv("TPKB_SWIPE3_GAIN"))   != NULL) swipe3_gain = atof(env);
     if ((env = getenv("TPKB_TAPCLICK"))      != NULL) tap_on      = atoi(env);
+    if ((env = getenv("TPKB_TAP_RIGHT"))     != NULL) tap_right_on = atoi(env);
     if ((env = getenv("TPKB_TAP_MS"))        != NULL) tap_ms_thresh = atoi(env);
     if ((env = getenv("TPKB_TYPELOCK_MS"))   != NULL) typelock_ms = atoi(env);
     if ((env = getenv("TPKB_SWAP_WINALT"))   != NULL) swap_winalt  = atoi(env);
