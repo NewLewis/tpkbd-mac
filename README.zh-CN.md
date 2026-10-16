@@ -16,7 +16,7 @@ ThinkPad X1 Tablet Thin Keyboard Gen 3（Chicony 代工，USB VID `17ef` PID `60
 |---|---|---|
 | 单指移动 | 光标 | 速度 `TPKB_MOVE_GAIN` 可调；可跨到外接扩展屏 |
 | 单指按压 | 左键 | 松开 5 帧消抖；双击选词/三击选段正常 |
-| 按住不放 + 移动（任意指数） | 拖移 / 选中文本 | 按住期间触摸全部变拖移，滚动/手势让位；指针跟随最新落下的手指，可换指接力 |
+| 按住不放 + 移动（任意指数） | 拖移 / 选中文本 | 按住期间触摸全部变拖移，滚动/手势让位；指针跟随最新落下的手指，可换指接力；按压沉陷微移被吞（drag slop，点击干净） |
 | 单指轻点 | 左键 | <250ms 且位移 <10 counts 才算点；支持双击/三击连击 |
 | 双指移动 | 丝滑滚动 | 手势相位事件流——App 把它当真触控板而非鼠标滚轮 |
 | 双指甩动 | 惯性滚动 | 移植 Mac Mouse Fix 的触控板物理曲线 |
@@ -72,6 +72,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.pjr.tpkbd-touchpad.p
 | `TPKB_SCROLL_NATURAL` | 1 | 1=自然滚动 |
 | `TPKB_TAPCLICK` | 1 | 轻点点按 |
 | `TPKB_TAP_RIGHT` | 0 | 双指轻点=右键（默认关；双指物理按压始终是右键） |
+| `TPKB_DRAG_SLOP` | 12 | 按下瞬间的拖移抑制阈值（传感器 counts）：按压沉陷的微移被吞掉、点击保持干净（截图选窗等依赖）；0 关闭 |
 | `TPKB_TAP_MS` | 250 | 轻点最长时长(ms) |
 | `TPKB_SWIPE3` | 1 | 三指手势 |
 | `TPKB_SWIPE3_GAIN` | 1.0 | 三指滑动速度 |

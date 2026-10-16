@@ -261,6 +261,9 @@ static int      tap_active = 0;        // 本轮触摸已记录
 static uint64_t tap_down_ms = 0;
 static int      tap_anchor_x = 0, tap_anchor_y = 0;
 static int      btn_type = 0;          // 0=左键 1=右键(按压期间锁定)
+static int      drag_armed = 0;        // 按下后拖移抑制期: 位移未过阈值前吞微移
+static int      drag_ax = 0, drag_ay = 0;  // 按下瞬间跟踪指的 pad 坐标(抑制锚点)
+static int      drag_slop = 12;        // TPKB_DRAG_SLOP(counts): 按下沉陷抑制阈值
 
 // ---- 打字锁定 (disable-while-typing, libinput DWT 语义) ----
 // 敲键后 typelock_ms 内吞掉触摸板的"新"触摸(移动/滚动/手势/轻点/新按压);
@@ -1013,23 +1016,38 @@ static void handle_report(uint32_t cb_rid, uint8_t *r, CFIndex len) {
                 if (debug) fprintf(stderr, "[tpkbd] MV anchor slot=%d pad=(%d,%d) cur=(%.0f,%.0f)\n",
                                    s, fx[s], fy[s], cur.x, cur.y);
             } else {
-                int nx = last_sx + (int)((fx[s] - last_px) * move_gain);
-                int ny = last_sy + (int)((fy[s] - last_py) * move_gain);
-                if (debug) fprintf(stderr, "[tpkbd] MV slot=%d pad=(%d,%d) last=(%d,%d) d=(%d,%d) -> (%d,%d)\n",
-                                   s, fx[s], fy[s], last_px, last_py,
-                                   fx[s]-last_px, fy[s]-last_py, nx, ny);
-                clamp_to_screen(&nx, &ny);
-                avoid_gap(&nx, &ny, last_sx, last_sy);
-                // 按住期间必须发 Dragged 而非 Moved: 按下时板面下沉, 触点
-                // 天然有微小位移, 若在 Down/Up 之间插入 Moved, App 的点击
-                // 跟踪会取消该次点击(表现为"点按偶尔不灵")。
-                if (btn_prev) {
-                    if (btn_type) post_right_drag(CGPointMake(nx, ny));
-                    else          post_mouse_drag(CGPointMake(nx, ny));
-                } else {
-                    post_mouse_move(CGPointMake(nx, ny));
+                int suppress = 0;
+                if (btn_prev && drag_armed) {
+                    // 按下拖移抑制(drag slop, 同原生触控板): 板面下压沉陷的
+                    // 微移不是拖移 — 截图/选窗类工具靠"点击瞬间零位移"工作,
+                    // 微移会被当成拉小框。越过阈值后恢复普通拖移。
+                    if (abs(fx[s] - drag_ax) + abs(fy[s] - drag_ay) < drag_slop) {
+                        suppress = 1;
+                        if (debug) fprintf(stderr, "[tpkbd] DRAG slop d=(%d,%d) swallowed\n",
+                                           fx[s] - drag_ax, fy[s] - drag_ay);
+                    } else {
+                        drag_armed = 0;
+                    }
                 }
-                cur.x = nx; cur.y = ny;
+                if (!suppress) {
+                    int nx = last_sx + (int)((fx[s] - last_px) * move_gain);
+                    int ny = last_sy + (int)((fy[s] - last_py) * move_gain);
+                    if (debug) fprintf(stderr, "[tpkbd] MV slot=%d pad=(%d,%d) last=(%d,%d) d=(%d,%d) -> (%d,%d)\n",
+                                       s, fx[s], fy[s], last_px, last_py,
+                                       fx[s]-last_px, fy[s]-last_py, nx, ny);
+                    clamp_to_screen(&nx, &ny);
+                    avoid_gap(&nx, &ny, last_sx, last_sy);
+                    // 按住期间必须发 Dragged 而非 Moved: 按下时板面下沉, 触点
+                    // 天然有微小位移, 若在 Down/Up 之间插入 Moved, App 的点击
+                    // 跟踪会取消该次点击(表现为"点按偶尔不灵")。
+                    if (btn_prev) {
+                        if (btn_type) post_right_drag(CGPointMake(nx, ny));
+                        else          post_mouse_drag(CGPointMake(nx, ny));
+                    } else {
+                        post_mouse_move(CGPointMake(nx, ny));
+                    }
+                    cur.x = nx; cur.y = ny;
+                }
             }
             move_slot = s;
             last_px = fx[s]; last_py = fy[s];
@@ -1060,6 +1078,13 @@ static void handle_report(uint32_t cb_rid, uint8_t *r, CFIndex len) {
                                    click_count, cur.x, cur.y);
                 post_click(cur, 1, click_count);
             }
+            // 拖移抑制锚点: 记按下瞬间跟踪指位置(沉陷微移在其邻域内被吞)
+            {
+                int fs = -1, fseq = 0;
+                for (int i = 0; i < NFINGER; i++)
+                    if (tips[i] && down_seq[i] > fseq) { fseq = down_seq[i]; fs = i; }
+                if (fs >= 0) { drag_armed = 1; drag_ax = fx[fs]; drag_ay = fy[fs]; }
+            }
             btn_prev = 1;
         }
     } else if (btn_prev) {
@@ -1073,6 +1098,7 @@ static void handle_report(uint32_t cb_rid, uint8_t *r, CFIndex len) {
             }
             btn_prev = 0;
             release_streak = 0;
+            drag_armed = 0;   // 本轮按压结束, 抑制期随之结束
         }
     }
 
@@ -1219,6 +1245,7 @@ int main(int argc, char **argv) {
     if ((env = getenv("TPKB_SWIPE3_GAIN"))   != NULL) swipe3_gain = atof(env);
     if ((env = getenv("TPKB_TAPCLICK"))      != NULL) tap_on      = atoi(env);
     if ((env = getenv("TPKB_TAP_RIGHT"))     != NULL) tap_right_on = atoi(env);
+    if ((env = getenv("TPKB_DRAG_SLOP"))     != NULL) drag_slop   = atoi(env);
     if ((env = getenv("TPKB_TAP_MS"))        != NULL) tap_ms_thresh = atoi(env);
     if ((env = getenv("TPKB_TYPELOCK_MS"))   != NULL) typelock_ms = atoi(env);
     if ((env = getenv("TPKB_SWAP_WINALT"))   != NULL) swap_winalt  = atoi(env);

@@ -16,7 +16,7 @@ It turns out the touchpad also implements the **standard HID multitouch digitize
 |---|---|---|
 | 1-finger move | Pointer | Speed via `TPKB_MOVE_GAIN`; cursor can cross into external displays |
 | 1-finger physical press | Left click | 5-frame debounce, proper double/triple-click counts |
-| Button held + finger move | Drag / text selection | While pressed, all touch becomes drag — scrolling and gestures yield; pointer follows the newest finger (finger-walking) |
+| Button held + finger move | Drag / text selection | While pressed, all touch becomes drag — scrolling and gestures yield; pointer follows the newest finger (finger-walking); press-sink micro-movement is swallowed (drag slop) |
 | 1-finger tap | Left click | <250 ms and <10 counts of travel; supports double/triple tap |
 | 2-finger move | Smooth scrolling | Gesture-phase event stream — apps treat it like a real trackpad, not a mouse wheel |
 | 2-finger flick | Momentum scrolling | Physics curve ported from Mac Mouse Fix's trackpad-like defaults |
@@ -72,6 +72,7 @@ Everything is an environment variable in the plist — change and `launchctl boo
 | `TPKB_SCROLL_NATURAL` | 1 | 1 = natural scrolling |
 | `TPKB_TAPCLICK` | 1 | Tap-to-click |
 | `TPKB_TAP_RIGHT` | 0 | 2-finger tap = right click (off by default; 2-finger press is always right click) |
+| `TPKB_DRAG_SLOP` | 12 | Click-time drag slop (sensor counts): movement below this right after a press is swallowed so the press reads as a clean click — screenshot window-picking etc. depend on it; 0 disables |
 | `TPKB_TAP_MS` | 250 | Max tap duration (ms) |
 | `TPKB_SWIPE3` | 1 | 3-finger gestures |
 | `TPKB_SWIPE3_GAIN` | 1.0 | 3-finger swipe speed |
