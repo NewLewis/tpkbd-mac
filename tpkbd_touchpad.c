@@ -523,6 +523,126 @@ static void end_scroll_gesture(void) {
     }
 }
 
+// ---- 小红点中键: 按住+拨动=丝滑滚动, 单击=可配(默认无动作) ----
+// 机制: 会话级过滤型鼠标 tap。中键按下先吞掉、语义待定:
+//   - 按住期间位移累计过阈值 → 进入滚动模式, 指针位移事件被吞并转成
+//     手势相位滚动(复用双指滚动全套: 相位流+EMA+惯性)。
+//   - 未拨动就松开 = 干净单击 → 默认无动作;
+//     TPKB_TP_CLICK=terminal 打开 Terminal / native 补发原生中键。
+//   - 松开后 200ms 继续吞位移: 小红点弹簧回中会产生反向增量, 不吞会拉扯光标。
+// 已知边界(实证 2026-10-16):
+//  1) 事件 tap 分不清事件来自哪个指针设备 — 中键按住期间系统内一切指针
+//     移动都会变成滚动(含本驱动合成的触摸板移动)。
+//  2) WindowServer 在事件到达会话层 tap 之前就更新了光标 — 吞事件拦不住
+//     光标位移, 中键滚动期间光标会跟着小幅漂移。试过逐帧补发反向事件抵消:
+//     光标仍漂且闪烁, 已回退, 勿再试。彻底根治需抢占 HID 设备(seize), 暂不做。
+//  3) tap 超时被系统禁用时自动重启, 期间事件直通(回落为原生行为, 不会卡死)。
+static int       tp_scroll_on = 1;      // TPKB_TP_SCROLL, 0=整个功能关闭(tap 不建)
+static float     tp_gain = 2.5f;        // TPKB_TP_GAIN: 小红点位移→滚动像素增益
+static int       tp_click_action = 0;   // TPKB_TP_CLICK: 0=无动作(默认)/1=Terminal/2=原生中键
+static int       tp_armed = 0;          // 中键按住中(位移未过阈值)
+static int       tp_scrolling = 0;      // 已进入滚动模式
+static int       tp_acc = 0;            // 按住期间累计位移
+static int       tp_repost = 0;         // none 模式补发原生中键的透传计数
+static int       tp_diag = 0;           // 诊断日志计数(每手势前 30 条)
+static uint64_t  tp_settle_until = 0;   // 松开后的回中吞咽窗口
+static uint64_t  tp_last_ms = 0;        // 上一帧时刻(EMA 用)
+static CFMachPortRef mouse_tap_port = NULL;
+
+static void spawn_open_terminal(void) {
+    extern char **environ;
+    pid_t pid;
+    posix_spawnattr_t attr;
+    posix_spawnattr_init(&attr);
+    char *argv[] = { (char *)"/usr/bin/open", (char *)"-a", (char *)"Terminal", NULL };
+    int r = posix_spawn(&pid, "/usr/bin/open", NULL, &attr, argv, environ);
+    posix_spawnattr_destroy(&attr);
+    if (r == 0) {
+        int st = 0; waitpid(pid, &st, 0);
+        if (debug) fprintf(stderr, "[tpkbd] TP click → Terminal (st=%d)\n", st);
+    } else if (debug) {
+        fprintf(stderr, "[tpkbd] TP click → open 启动失败 (errno=%d)\n", r);
+    }
+}
+
+static CGEventRef mouse_tap_cb(CGEventTapProxy proxy, CGEventType type,
+                               CGEventRef event, void *userInfo) {
+    (void)proxy; (void)userInfo;
+    if (type == kCGEventTapDisabledByTimeout) {
+        if (mouse_tap_port) CGEventTapEnable(mouse_tap_port, true);
+        return event;
+    }
+    if (type == kCGEventTapDisabledByUserInput) {
+        // 在回调内发事件可能触发系统禁用 tap; 诊断期记录并立即重启
+        fprintf(stderr, "[tpkbd] TPD tap disabled-by-user-input, re-enabling\n");
+        if (mouse_tap_port) CGEventTapEnable(mouse_tap_port, true);
+        return event;
+    }
+
+    if (type == kCGEventOtherMouseDown || type == kCGEventOtherMouseUp) {
+        long btn = CGEventGetIntegerValueField(event, kCGMouseEventButtonNumber);
+        if (btn != 2) return event;
+        if (tp_repost) { tp_repost--; return event; }   // none 模式补发的原生中键
+        if (type == kCGEventOtherMouseDown) {
+            mom_stop();                   // 新一轮中键手势截停惯性
+            tp_armed = 1; tp_scrolling = 0; tp_acc = 0; tp_last_ms = 0;
+            tp_diag = 0;
+            fprintf(stderr, "[tpkbd] TPD mid-down seen (armed)\n");
+            return NULL;                  // 语义待定: 拨动=滚动, 干净松开=单击
+        }
+        fprintf(stderr, "[tpkbd] TPD mid-up: scrolled=%d acc=%d\n", tp_scrolling, tp_acc);
+        if (tp_scrolling) end_scroll_gesture();   // Ended + 够快接惯性
+        else if (tp_armed && tp_click_action == 1) spawn_open_terminal();
+        else if (tp_armed && tp_click_action == 2) {
+            // none: 补发原生中键(浏览器新标签页等); 计数防重入
+            CGPoint p = CGEventGetLocation(event);
+            CGEventRef d = CGEventCreateMouseEvent(NULL, kCGEventOtherMouseDown, p, 2);
+            CGEventRef u = CGEventCreateMouseEvent(NULL, kCGEventOtherMouseUp, p, 2);
+            tp_repost = 2;
+            if (d) { CGEventPost(g_tap, d); CFRelease(d); }
+            if (u) { CGEventPost(g_tap, u); CFRelease(u); }
+        }
+        tp_armed = 0; tp_scrolling = 0; tp_acc = 0;
+        tp_settle_until = now_ms() + 200;
+        return NULL;
+    }
+
+    if (type != kCGEventMouseMoved && type != kCGEventLeftMouseDragged &&
+        type != kCGEventRightMouseDragged && type != kCGEventOtherMouseDragged)
+        return event;
+    long dx = CGEventGetIntegerValueField(event, kCGMouseEventDeltaX);
+    long dy = CGEventGetIntegerValueField(event, kCGMouseEventDeltaY);
+    if (debug && tp_diag < 30) {
+        fprintf(stderr, "[tpkbd] TPD move type=%d d=(%ld,%ld) armed=%d scrolling=%d\n",
+                (int)type, dx, dy, tp_armed, tp_scrolling);
+        tp_diag++;
+    }
+    if (!tp_armed && !tp_scrolling) {
+        if (tp_settle_until && now_ms() < tp_settle_until) return NULL;
+        tp_settle_until = 0;
+        return event;                     // 平时零干预
+    }
+    if (!tp_scrolling) {
+        tp_acc += (int)(labs(dx) + labs(dy));
+        if (tp_acc < 8) return NULL;      // 微抖吞掉
+        tp_scrolling = 1;
+        gesture_send_maybegin();
+    }
+    // 拨下=内容下滚(与触控板自然滚动同向); 帧增量转滚动 + 维护惯性 EMA
+    double sdx = (double)dx * tp_gain, sdy = (double)dy * tp_gain;
+    uint64_t nms = now_ms();
+    double dtms = tp_last_ms ? (double)(nms - tp_last_ms) : 10.0;
+    if (dtms <= 0) dtms = 10.0;
+    scrl_ema_x = scrl_ema_x * 0.7 + ((natural ? sdx : -sdx) / dtms) * 0.3;
+    scrl_ema_y = scrl_ema_y * 0.7 + ((natural ? sdy : -sdy) / dtms) * 0.3;
+    last_scrl_ms = nms;
+    tp_last_ms = nms;
+    post_gesture_scroll(sdx, sdy);
+    if (debug) fprintf(stderr, "[tpkbd] TPSC d=(%ld,%ld) v=%.0fpx/s\n",
+                       dx, dy, hypot(scrl_ema_x, scrl_ema_y) * 1000.0);
+    return NULL;
+}
+
 // ---- 三指左右滑: 切换全屏应用/桌面空间 (Dock Swipe) ----
 // 移植自 Mac Mouse Fix (TouchSimulator.m + ModifiedDragOutputThreeFingerSwipe.m),
 // macOS 27 路径: CGEvent 字段被系统忽略, 必须构造私有 IOHIDEvent 挂进 CGEvent。
@@ -1246,6 +1366,13 @@ int main(int argc, char **argv) {
     if ((env = getenv("TPKB_TAPCLICK"))      != NULL) tap_on      = atoi(env);
     if ((env = getenv("TPKB_TAP_RIGHT"))     != NULL) tap_right_on = atoi(env);
     if ((env = getenv("TPKB_DRAG_SLOP"))     != NULL) drag_slop   = atoi(env);
+    if ((env = getenv("TPKB_TP_SCROLL"))     != NULL) tp_scroll_on = atoi(env);
+    if ((env = getenv("TPKB_TP_GAIN"))       != NULL) tp_gain      = atof(env);
+    if ((env = getenv("TPKB_TP_CLICK"))      != NULL) {
+        if      (!strcmp(env, "terminal")) tp_click_action = 1;
+        else if (!strcmp(env, "native"))   tp_click_action = 2;
+        else                               tp_click_action = 0;
+    }
     if ((env = getenv("TPKB_TAP_MS"))        != NULL) tap_ms_thresh = atoi(env);
     if ((env = getenv("TPKB_TYPELOCK_MS"))   != NULL) typelock_ms = atoi(env);
     if ((env = getenv("TPKB_SWAP_WINALT"))   != NULL) swap_winalt  = atoi(env);
@@ -1327,6 +1454,30 @@ int main(int argc, char **argv) {
                 typelock_ms);
     } else {
         fprintf(stderr, "[tpkbd] 打字锁定: 键盘 tap 创建失败, 功能不生效\n");
+    }
+
+    // 小红点中键: 按住+拨动=滚动, 单击=Terminal (过滤型 tap, 需辅助功能授权)
+    if (tp_scroll_on) {
+        CGEventMask mmask = CGEventMaskBit(kCGEventOtherMouseDown) |
+                            CGEventMaskBit(kCGEventOtherMouseUp)   |
+                            CGEventMaskBit(kCGEventMouseMoved)     |
+                            CGEventMaskBit(kCGEventLeftMouseDragged) |
+                            CGEventMaskBit(kCGEventRightMouseDragged) |
+                            CGEventMaskBit(kCGEventOtherMouseDragged);
+        mouse_tap_port = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap,
+                                          kCGEventTapOptionDefault,
+                                          mmask, mouse_tap_cb, NULL);
+        if (mouse_tap_port) {
+            CFRunLoopSourceRef msrc = CFMachPortCreateRunLoopSource(NULL, mouse_tap_port, 0);
+            CFRunLoopAddSource(CFRunLoopGetMain(), msrc, kCFRunLoopDefaultMode);
+            CFRelease(msrc);
+            CGEventTapEnable(mouse_tap_port, true);
+            fprintf(stderr, "[tpkbd] 小红点中键: 滚动模式就绪 (按住+拨动=滚动, 单击=%s)\n",
+                    tp_click_action == 1 ? "Terminal" :
+                    tp_click_action == 2 ? "原生中键" : "无动作");
+        } else {
+            fprintf(stderr, "[tpkbd] 小红点中键: 鼠标 tap 创建失败, 功能不生效\n");
+        }
     }
 
     CFRunLoopRun();

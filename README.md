@@ -25,6 +25,7 @@ It turns out the touchpad also implements the **standard HID multitouch digitize
 | 3-finger swipe up / down | Mission Control / App Exposé | |
 | Any typing | Touchpad locked for 500 ms | libinput-style disable-while-typing; touches already in progress are exempt; held buttons never stick |
 | Win ↔ Alt keys | Remapped to Option / Command | Matches the Mac bottom-row layout, applied via `hidutil` **only to this keyboard** |
+| Hold middle button + TrackPoint | Smooth scrolling | Classic ThinkPad scrolling with momentum; the cursor drifts slightly while active (known limitation, see Troubleshooting); a plain middle click does nothing by default — remap with `TPKB_TP_CLICK` |
 
 The TrackPoint is deliberately left untouched — macOS already drives it natively.
 
@@ -78,6 +79,9 @@ Everything is an environment variable in the plist — change and `launchctl boo
 | `TPKB_SWIPE3_GAIN` | 1.0 | 3-finger swipe speed |
 | `TPKB_TYPELOCK_MS` | 500 | Typing lockout window, 0 = off |
 | `TPKB_SWAP_WINALT` | 1 | Win↔Alt remap to Option/Command |
+| `TPKB_TP_SCROLL` | 1 | TrackPoint middle-button scrolling on/off |
+| `TPKB_TP_GAIN` | 2.5 | TrackPoint movement → scroll pixel gain |
+| `TPKB_TP_CLICK` | *(none)* | Plain middle-click action: nothing (default), `terminal`, or `native` (real middle click) |
 | `TPKB_MOMENTUM` / `TPKB_DRAG_A` / `TPKB_DRAG_B` | 1 / 30 / 0.7 | Momentum scrolling on/off and its drag-curve physics (a·v^b) |
 | `TPKB_DEBUG` | 0 | Verbose logging to `/tmp/tpkbd.log` |
 
@@ -98,6 +102,7 @@ See [docs/devlog.md](docs/devlog.md) for the full reverse-engineering story, inc
 - **Rebuilt the binary, behavior unchanged** → launchd still runs the old image: `launchctl kickstart -k gui/$(id -u)/com.pjr.tpkbd-touchpad`.
 - **Permissions lost after rebuild** → you're ad-hoc signing; create the `tpkbd-sign` cert (see Install).
 - **Permissions lost after moving the binary** → TCC grants are bound to the binary's **absolute path** as well as its signing identity. Deploy the daemon to a stable path once (e.g. `TPKB_INSTALL_DIR="$HOME/Library/Application Support/tpkbd-mac" ./build.sh`) and point the LaunchAgent there, so reorganizing your source tree never breaks the grants again.
+- **Cursor drifts while scrolling with the TrackPoint middle button** → known limitation: the WindowServer moves the cursor before session-level event taps see the event, so swallowed movement still shifts the cursor slightly. Swallowing still prevents apps from seeing the drag, so the scroll itself is clean; a full fix would require seizing the HID device (not implemented).
 - Logs: `tail -f /tmp/tpkbd.log` (set `TPKB_DEBUG=1` for full report dumps).
 
 ## Limitations

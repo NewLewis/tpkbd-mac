@@ -25,6 +25,7 @@ ThinkPad X1 Tablet Thin Keyboard Gen 3（Chicony 代工，USB VID `17ef` PID `60
 | 三指上滑 / 下滑 | 调度中心 / App Exposé | |
 | 打字中 | 触摸板锁定 500ms | libinput 式 disable-while-typing；在板手势放行、按住的键不卡死 |
 | Win ↔ Alt 键 | 互换为 Option / Command | 对齐 Mac 底排排列，经 `hidutil` **只对本键盘**生效 |
+| 按住中键 + 拨小红点 | 丝滑滚动 | 经典 ThinkPad 滚动（带惯性）；期间光标会小幅漂移（已知限制，见疑难排查）；中键单击默认无动作，`TPKB_TP_CLICK` 可配 |
 
 小红点故意完全不碰——macOS 原生已驱动它。
 
@@ -78,6 +79,9 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.pjr.tpkbd-touchpad.p
 | `TPKB_SWIPE3_GAIN` | 1.0 | 三指滑动速度 |
 | `TPKB_TYPELOCK_MS` | 500 | 打字锁定窗口, 0=关 |
 | `TPKB_SWAP_WINALT` | 1 | Win↔Alt 互换 |
+| `TPKB_TP_SCROLL` | 1 | 小红点中键滚动开关 |
+| `TPKB_TP_GAIN` | 2.5 | 小红点位移→滚动像素增益 |
+| `TPKB_TP_CLICK` | 无 | 中键单击行为：无动作（默认）/ `terminal` / `native`（原生中键） |
 | `TPKB_MOMENTUM` / `TPKB_DRAG_A` / `TPKB_DRAG_B` | 1 / 30 / 0.7 | 惯性滚动开关与物理曲线 (a·v^b) |
 | `TPKB_DEBUG` | 0 | 详细日志到 `/tmp/tpkbd.log` |
 
@@ -98,6 +102,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.pjr.tpkbd-touchpad.p
 - **重编译后行为没变** → launchd 还在跑旧二进制：`launchctl kickstart -k gui/$(id -u)/com.pjr.tpkbd-touchpad`。
 - **重编译后授权失效** → 在用 ad-hoc 签名；按安装一节创建 `tpkbd-sign` 证书。
 - **移动二进制后授权失效** → TCC 授权同时绑定签名身份和二进制的**绝对路径**。建议把守护进程一次性部署到稳定路径（如 `TPKB_INSTALL_DIR="$HOME/Library/Application Support/tpkbd-mac" ./build.sh`）、LaunchAgent 指向那里，之后随便整理源码目录都不会再断授权。
+- **小红点中键滚动时光标小幅漂移** → 已知限制：WindowServer 在事件到达会话层 tap 之前就更新了光标，吞掉的事件仍会让光标微动。App 侧不会看到拖拽（滚动本身是干净的）；彻底修复需要抢占 HID 设备（未实现）。
 - 日志：`tail -f /tmp/tpkbd.log`（`TPKB_DEBUG=1` 可看全量报文转储）。
 
 ## 已知限制
