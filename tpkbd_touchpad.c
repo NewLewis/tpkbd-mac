@@ -173,13 +173,36 @@ static void update_display_bounds(void) {
     screen_bounds = u;
 }
 
-// 屏幕插拔/排列/分辨率变化时刷新(回调在主 runloop 上派发)
-static void display_reconfig_cb(CGDirectDisplayID d, CGDisplayChangeSummaryFlags f, void *u) {
-    (void)d; (void)f; (void)u;
+// 屏幕插拔/排列/分辨率变化时刷新(回调在主 runloop 上派发)。
+// 实证坑(2026-10-16): 守护进程以 1 屏启动后插回扩展屏, 光标仍被钳在主屏 —
+// 末次回调时 CGGetActiveDisplayList 可能尚未反映新屏(变更分阶段派发、
+// 末态滞后), 因此回调里立即刷一次 + 1.5s 后复扫兜底; 日志无条件输出。
+static void disp_rescan_cb(CFRunLoopTimerRef t, void *info) {
+    (void)t; (void)info;
     update_display_bounds();
-    if (debug) fprintf(stderr, "[tpkbd] 显示器配置变化, 虚拟桌面=(%.0f,%.0f %.0fx%.0f)\n",
-                       screen_bounds.origin.x, screen_bounds.origin.y,
-                       screen_bounds.size.width, screen_bounds.size.height);
+    fprintf(stderr, "[tpkbd] 显示器复扫: %u屏, 虚拟桌面=(%.0f,%.0f %.0fx%.0f)\n",
+            g_display_count,
+            screen_bounds.origin.x, screen_bounds.origin.y,
+            screen_bounds.size.width, screen_bounds.size.height);
+}
+
+static void display_reconfig_cb(CGDirectDisplayID d, CGDisplayChangeSummaryFlags f, void *u) {
+    (void)d; (void)u;
+    update_display_bounds();
+    fprintf(stderr, "[tpkbd] 显示器配置变化 flags=0x%x → %u屏, 虚拟桌面=(%.0f,%.0f %.0fx%.0f)\n",
+            (unsigned)f, g_display_count,
+            screen_bounds.origin.x, screen_bounds.origin.y,
+            screen_bounds.size.width, screen_bounds.size.height);
+    static CFRunLoopTimerRef rescan = NULL;
+    if (rescan) {
+        CFRunLoopRemoveTimer(CFRunLoopGetMain(), rescan, kCFRunLoopDefaultMode);
+        CFRelease(rescan);
+    }
+    CFRunLoopTimerContext ctx = {0};
+    rescan = CFRunLoopTimerCreate(kCFAllocatorDefault,
+                                  CFAbsoluteTimeGetCurrent() + 1.5, 0, 0, 0,
+                                  disp_rescan_cb, &ctx);
+    if (rescan) CFRunLoopAddTimer(CFRunLoopGetMain(), rescan, kCFRunLoopDefaultMode);
 }
 
 static int point_on_display(int x, int y) {
