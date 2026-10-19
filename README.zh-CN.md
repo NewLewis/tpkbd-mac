@@ -17,7 +17,7 @@ ThinkPad X1 Tablet Thin Keyboard Gen 3（Chicony 代工，USB VID `17ef` PID `60
 | 单指移动 | 光标 | 速度 `TPKB_MOVE_GAIN` 可调；可跨到外接扩展屏 |
 | 单指按压 | 左键 | 松开 5 帧消抖；双击选词/三击选段正常 |
 | 按住不放 + 移动（任意指数） | 拖移 / 选中文本 | 按住期间触摸全部变拖移，滚动/手势让位；指针跟随最新落下的手指，可换指接力；按压沉陷微移被吞（drag slop，点击干净） |
-| 单指轻点 | 左键 | <250ms 且位移 <10 counts 才算点；支持双击/三击连击 |
+| 单指轻点 | 左键 | <250ms 且位移 <1.3mm（取 libinput 阈值）才算点；落板跳变伪影已滤除；支持双击/三击连击 |
 | 双指移动 | 丝滑滚动 | 手势相位事件流——App 把它当真触控板而非鼠标滚轮 |
 | 双指甩动 | 惯性滚动 | 移植 Mac Mouse Fix 的触控板物理曲线 |
 | 双指按压 | 右键 | 双指轻点=右键默认关（易误触），`TPKB_TAP_RIGHT=1` 可打开 |
@@ -74,6 +74,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.pjr.tpkbd-touchpad.p
 | `TPKB_TAPCLICK` | 1 | 轻点点按 |
 | `TPKB_TAP_RIGHT` | 0 | 双指轻点=右键（默认关；双指物理按压始终是右键） |
 | `TPKB_DRAG_SLOP` | 12 | 按下瞬间的拖移抑制阈值（传感器 counts）：按压沉陷的微移被吞掉、点击保持干净（截图选窗等依赖）；0 关闭 |
+| `TPKB_MOVE_SLOP` | 14 | 落指死区（传感器 counts）≈ libinput 的 1.3mm 轻点位移阈值：落板沉降微移不动光标、也不取消轻点；越阈后一次性补发累计位移 |
 | `TPKB_TAP_MS` | 250 | 轻点最长时长(ms) |
 | `TPKB_SWIPE3` | 1 | 三指手势 |
 | `TPKB_SWIPE3_GAIN` | 1.0 | 三指滑动速度 |
@@ -114,6 +115,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.pjr.tpkbd-touchpad.p
 ## 致谢
 
 - **[Mac Mouse Fix](https://github.com/noah-nuebling/mac-mouse-fix)**（Noah Nuebling）——"原生 Mac 触控板到底发什么事件"的唯一真相源。本项目的手势相位滚动设计、惯性参数、DockSwipe 构造均衍生自其源码（依 [MMF License](https://github.com/noah-nuebling/mac-mouse-fix/blob/master/License) 使用）。觉得这套手感好，请去付费支持 MMF。
+- **[libinput](https://gitlab.freedesktop.org/libinput/libinput)**——轻点位移阈值（1.3mm）与落指死区采用了它的 `DEFAULT_TAP_MOVE_THRESHOLD`（基于本板落板沉降伪影的实测标定）。
 - Linux `hid-lenovo` 驱动的相关讨论，佐证了这个键盘家族有标准 digitizer 模式。
 
 ## 许可证

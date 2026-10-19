@@ -287,6 +287,13 @@ static int      btn_type = 0;          // 0=左键 1=右键(按压期间锁定)
 static int      drag_armed = 0;        // 按下后拖移抑制期: 位移未过阈值前吞微移
 static int      drag_ax = 0, drag_ay = 0;  // 按下瞬间跟踪指的 pad 坐标(抑制锚点)
 static int      drag_slop = 12;        // TPKB_DRAG_SLOP(counts): 按下沉陷抑制阈值
+static int      move_slop = 14;        // TPKB_MOVE_SLOP(counts): 落指死区, 0=关
+                                        // 默认取 libinput DEFAULT_TAP_MOVE_THRESHOLD
+                                        // = 1.3mm ≈ 14 counts(本板 ~11 counts/mm),
+                                        // 沉降伪影(实测 7~18 counts)整体吞掉
+static int      mv_slop_done = 0;      // 本轮接触已越过落指死区
+static int      mv_frames = 0;         // 本轮接触已跟踪帧数
+static int      snap_done = 0;         // 本轮接触已吞掉落板跳变(仅一次)
 
 // ---- 打字锁定 (disable-while-typing, libinput DWT 语义) ----
 // 敲键后 typelock_ms 内吞掉触摸板的"新"触摸(移动/滚动/手势/轻点/新按压);
@@ -1021,7 +1028,7 @@ static void handle_report(uint32_t cb_rid, uint8_t *r, CFIndex len) {
                 tap_anchor_x = fx[prim]; tap_anchor_y = fy[prim];
             }
             if (ntips > tap_nfid) tap_nfid = ntips;
-            if (abs(fx[prim] - tap_anchor_x) > 10 || abs(fy[prim] - tap_anchor_y) > 10)
+            if (abs(fx[prim] - tap_anchor_x) > move_slop || abs(fy[prim] - tap_anchor_y) > move_slop)
                 tap_moved = 1;
         }
     }
@@ -1154,22 +1161,52 @@ static void handle_report(uint32_t cb_rid, uint8_t *r, CFIndex len) {
         for (int i = 0; i < NFINGER; i++)
             if (tips[i] && down_seq[i] > sseq) { sseq = down_seq[i]; s = i; }
         if (s >= 0) {
+            int suppress = 0;
             if (!have_last || move_slot != s) {
                 // 新按下/换跟踪指: 仅锚定, 不跳动
                 if (debug) fprintf(stderr, "[tpkbd] MV anchor slot=%d pad=(%d,%d) cur=(%.0f,%.0f)\n",
                                    s, fx[s], fy[s], cur.x, cur.y);
+                mv_slop_done = 0;
+                mv_frames = 0;
+                snap_done = 0;
             } else {
-                int suppress = 0;
-                if (btn_prev && drag_armed) {
+                int disp = abs(fx[s] - last_px) + abs(fy[s] - last_py);
+                mv_frames++;
+                if (!snap_done && mv_frames <= 10 && disp > move_slop) {
+                    // 落板跳变伪影: 落板后接触面稳定, 质心会单帧大跳(实测
+                    // 10~18 counts, 方向朝掌侧=屏上向下)。它同时越过落指死区
+                    // (外泄成漂移)和轻点位移阈值(废掉轻点)。窗口内首次大跳
+                    // 判为伪影: 吞帧重锚, 移动/轻点锚点同步跟过去; 只吞一次,
+                    // 真正的快速甩动(连续大帧)不受影响。
+                    snap_done = 1;
+                    tap_anchor_x = fx[s]; tap_anchor_y = fy[s];
+                    tap_moved = 0;
+                    last_px = fx[s]; last_py = fy[s];
+                    suppress = 1;
+                    if (debug) fprintf(stderr, "[tpkbd] SNAP %d counts @frame %d, re-anchored\n",
+                                       disp, mv_frames);
+                } else if (btn_prev && drag_armed) {
                     // 按下拖移抑制(drag slop, 同原生触控板): 板面下压沉陷的
                     // 微移不是拖移 — 截图/选窗类工具靠"点击瞬间零位移"工作,
                     // 微移会被当成拉小框。越过阈值后恢复普通拖移。
                     if (abs(fx[s] - drag_ax) + abs(fy[s] - drag_ay) < drag_slop) {
                         suppress = 1;
+                        last_px = fx[s]; last_py = fy[s];   // 静默重锚
                         if (debug) fprintf(stderr, "[tpkbd] DRAG slop d=(%d,%d) swallowed\n",
                                            fx[s] - drag_ax, fy[s] - drag_ay);
                     } else {
                         drag_armed = 0;
+                    }
+                } else if (!btn_prev && move_slop > 0 && !mv_slop_done) {
+                    // 落指死区(move slop): 手指落板瞬间接触质心自然下沉数
+                    // counts, 不滤掉的话"轻点点按"会先漂一下再点击(落点偏下)。
+                    // 死区内锚点保持不动, 越阈那帧的差分自带累计位移一次补发,
+                    // 正常滑行无感(与 drag slop 的静默重锚语义不同)。
+                    int disp = abs(fx[s] - last_px) + abs(fy[s] - last_py);
+                    if (disp < move_slop) {
+                        suppress = 1;
+                    } else {
+                        mv_slop_done = 1;
                     }
                 }
                 if (!suppress) {
@@ -1193,7 +1230,7 @@ static void handle_report(uint32_t cb_rid, uint8_t *r, CFIndex len) {
                 }
             }
             move_slot = s;
-            last_px = fx[s]; last_py = fy[s];
+            if (!suppress) { last_px = fx[s]; last_py = fy[s]; }  // 死区抑制期间保持锚点
             last_sx = (int)cur.x; last_sy = (int)cur.y;
             have_last = 1;
         }
@@ -1389,6 +1426,7 @@ int main(int argc, char **argv) {
     if ((env = getenv("TPKB_TAPCLICK"))      != NULL) tap_on      = atoi(env);
     if ((env = getenv("TPKB_TAP_RIGHT"))     != NULL) tap_right_on = atoi(env);
     if ((env = getenv("TPKB_DRAG_SLOP"))     != NULL) drag_slop   = atoi(env);
+    if ((env = getenv("TPKB_MOVE_SLOP"))     != NULL) move_slop   = atoi(env);
     if ((env = getenv("TPKB_TP_SCROLL"))     != NULL) tp_scroll_on = atoi(env);
     if ((env = getenv("TPKB_TP_GAIN"))       != NULL) tp_gain      = atof(env);
     if ((env = getenv("TPKB_TP_CLICK"))      != NULL) {

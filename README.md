@@ -17,7 +17,7 @@ It turns out the touchpad also implements the **standard HID multitouch digitize
 | 1-finger move | Pointer | Speed via `TPKB_MOVE_GAIN`; cursor can cross into external displays |
 | 1-finger physical press | Left click | 5-frame debounce, proper double/triple-click counts |
 | Button held + finger move | Drag / text selection | While pressed, all touch becomes drag — scrolling and gestures yield; pointer follows the newest finger (finger-walking); press-sink micro-movement is swallowed (drag slop) |
-| 1-finger tap | Left click | <250 ms and <10 counts of travel; supports double/triple tap |
+| 1-finger tap | Left click | <250 ms and <1.3 mm of travel (libinput's threshold); landing-snap artifacts are filtered; supports double/triple tap |
 | 2-finger move | Smooth scrolling | Gesture-phase event stream — apps treat it like a real trackpad, not a mouse wheel |
 | 2-finger flick | Momentum scrolling | Physics curve ported from Mac Mouse Fix's trackpad-like defaults |
 | 2-finger press | Right click | 2-finger *tap*-right-click is off by default (easy to trigger accidentally) — enable with `TPKB_TAP_RIGHT=1` |
@@ -74,6 +74,7 @@ Everything is an environment variable in the plist — change and `launchctl boo
 | `TPKB_TAPCLICK` | 1 | Tap-to-click |
 | `TPKB_TAP_RIGHT` | 0 | 2-finger tap = right click (off by default; 2-finger press is always right click) |
 | `TPKB_DRAG_SLOP` | 12 | Click-time drag slop (sensor counts): movement below this right after a press is swallowed so the press reads as a clean click — screenshot window-picking etc. depend on it; 0 disables |
+| `TPKB_MOVE_SLOP` | 14 | Landing dead zone (sensor counts), ≈ libinput's 1.3 mm tap-move threshold: landing-settle shifts don't move the cursor and don't cancel taps; crossing it releases tracking with the full distance replayed |
 | `TPKB_TAP_MS` | 250 | Max tap duration (ms) |
 | `TPKB_SWIPE3` | 1 | 3-finger gestures |
 | `TPKB_SWIPE3_GAIN` | 1.0 | 3-finger swipe speed |
@@ -114,6 +115,7 @@ See [docs/devlog.md](docs/devlog.md) for the full reverse-engineering story, inc
 ## Acknowledgements
 
 - **[Mac Mouse Fix](https://github.com/noah-nuebling/mac-mouse-fix)** by Noah Nuebling — the single most important reference for "what a native Mac trackpad actually emits". The gesture-phase scroll design, momentum parameters, and DockSwipe construction in this project are derived from its source code (used under the [MMF License](https://github.com/noah-nuebling/mac-mouse-fix/blob/master/License)). If you like how this feels, buy MMF.
+- **[libinput](https://gitlab.freedesktop.org/libinput/libinput)** — the tap-move threshold (1.3 mm) and the landing dead zone adopt its `DEFAULT_TAP_MOVE_THRESHOLD` after measuring this pad's landing-settle artifacts.
 - The Linux `hid-lenovo` driver discussions, for confirming this keyboard family exposes a standard digitizer mode.
 
 ## License
