@@ -61,7 +61,8 @@ static void reset(void) {
     test_cursor = CGPointMake(500, 500);
     screen_bounds = CGRectMake(0, 0, 2000, 1500);
     g_display_count = 1; g_display_bounds[0] = screen_bounds;
-    move_gain = 1.8f; move_slop = 14; drag_slop = 12;
+    move_gain = 1.8f; move_acceleration = 1; move_slop = 14; drag_slop = 12;
+    pointer_motion = (PointerMotion){0}; pointer_contact_id = -1;
     click_count = 0; last_down_ms = 0; release_streak = 0; drag_armed = 0;
     touch_now = type_lock_on = type_grandf = 0; last_key_ms = 0;
     test_time_ms += 1000;
@@ -366,7 +367,108 @@ static void tap_no_drift(void) {
     assert(test_cursor.y > 500);
 }
 
+static void pointer_precision_and_acceleration(void) {
+    // Fixed-gain comparison: ten one-count reports must move 18 pixels, not ten.
+    reset(); move_slop = 0; move_acceleration = 0;
+    pointer_report(1, 200, 200, 0, 7);
+    for (int i = 1; i <= 10; i++) pointer_report(1, 200 + i, 200, 0, 7);
+    assert(test_cursor.x == 518 && test_cursor.y == 500);
+    for (int i = 9; i >= 0; i--) pointer_report(1, 200 + i, 200, 0, 7);
+    assert(test_cursor.x == 500 && test_cursor.y == 500);
+
+    // Same physical travel: slow reports give precision; fast ones travel farther.
+    double travel[2];
+    for (int fast = 0; fast < 2; fast++) {
+        reset(); move_slop = 0;
+        pointer_report(1, 200, 200, 0, 7);
+        for (int i = 1; i <= 10; i++) pointer_report(1, 200 + i * 10, 200, 0, fast ? 5 : 100);
+        travel[fast] = test_cursor.x - 500;
+    }
+    assert(travel[0] == 90 && travel[1] == 360);
+
+    PointerMotion p;
+    pointer_motion_anchor(&p, 0, 0, 100, 1000000000);
+    int px, py, total = 0;
+    for (int i = 0; i < 100; i++) {
+        pointer_motion_apply(&p, 1, 0, 0.25, 0, &px, &py);
+        total += px;
+        assert(py == 0);
+        assert(fabs(p.remainder_x) <= 0.5);
+    }
+    assert(total == 25);
+    for (int i = 0; i < 100; i++) {
+        pointer_motion_apply(&p, -1, 0, 0.25, 0, &px, &py);
+        total += px;
+    }
+    assert(total == 0);
+    // A half-pixel remainder must not move a stationary axis, including when
+    // the OTHER axis is moving. Neither may stationary reports creep the cursor.
+    pointer_motion_apply(&p, 1, 0, 0.5, 0, &px, &py);
+    assert(p.remainder_x == -0.5);
+    for (int i = 0; i < 10; i++) {
+        pointer_motion_apply(&p, 0, 1, 0.5, 0, &px, &py);
+        assert(px == 0);
+        pointer_motion_apply(&p, 0, 0, 0.5, 0, &px, &py);
+        assert(px == 0 && py == 0);
+    }
+
+    // Continuous, monotonic, bounded gain without a threshold jump.
+    double previous = 0;
+    for (int speed = 0; speed <= 5000; speed++) {
+        double gain = pointer_motion_gain(speed, 1.8, 1);
+        assert(gain >= previous && gain >= 0.9 && gain <= 3.6);
+        if (speed) assert(gain - previous < 0.004);
+        previous = gain;
+    }
+    assert(fabs(pointer_motion_gain(825, 1.8, 1) - 2.25) < 1e-10);
+
+    // The same velocity must have the same gain at different report frequencies.
+    double speeds[2];
+    for (int k = 0; k < 2; k++) {
+        pointer_motion_anchor(&p, 0, 0, 0, 1000000000);
+        int dt = k ? 10 : 5, step = k ? 8 : 4;
+        for (int i = 1; i <= 20; i++)
+            pointer_motion_observe(&p, step * i, 0, 0, 1000000000 + (uint64_t)i * dt * 1000000);
+        speeds[k] = p.speed;
+    }
+    assert(fabs(speeds[0] - speeds[1]) < 1e-8 && fabs(speeds[0] - 800) < 1e-8);
+
+    // Scan clock wrap removes USB arrival jitter; slowing promptly lowers gain.
+    pointer_motion_anchor(&p, 0, 0, 65500, 1000000000);
+    pointer_motion_observe(&p, 14, 0, 35, 1009000000);
+    assert(fabs(p.speed - 14 / 0.0071) < 1e-8);
+    assert(p.ns == 1007100000);
+    for (int i = 1; i <= 3; i++)
+        pointer_motion_observe(&p, 14 + i, 0, 35 + i * 71, 1007100000 + (uint64_t)i * 7100000);
+    assert(pointer_motion_gain(p.speed, 1.8, 1) < 1.0);
+    pointer_motion_observe(&p, 17, 0, 0, 1500000000);
+    assert(p.speed == 0 && p.remainder_x == 0 && p.remainder_y == 0);
+
+    // No fraction/acceleration leaks through a new contact, scrolling, or a screen edge.
+    reset(); move_slop = 0; move_acceleration = 0; move_gain = 0.5f;
+    pointer_report(1, 200, 200, 0, 7);
+    pointer_report(1, 201, 200, 0, 7);
+    assert(pointer_motion.remainder_x == -0.5);
+    pointer_report(0, 201, 200, 0, 7);
+    pointer_report(1, 300, 300, 0, 7);
+    assert(pointer_motion.remainder_x == 0 && !pointer_motion.have_speed);
+    assert(test_cursor.x == 501);
+    report(2, 300, 300);
+    pointer_report(1, 300, 300, 0, 70);
+    pointer_report(1, 300, 300, 0, 70);
+    assert(pointer_motion.remainder_x == 0 && !pointer_motion.have_speed);
+
+    reset(); move_slop = 0; move_acceleration = 0;
+    test_cursor = CGPointMake(1999, 500);
+    pointer_report(1, 200, 200, 0, 7);
+    pointer_report(1, 201, 200, 0, 7);
+    assert(test_cursor.x == 1999 && pointer_motion.remainder_x == 0);
+    pointer_report(1, 200, 200, 0, 7);
+    assert(test_cursor.x == 1997);
+}
+
 int main(void) {
+    pointer_precision_and_acceleration();
     tap_no_drift();
     slow_scroll();
     distance_and_direction();
@@ -375,6 +477,6 @@ int main(void) {
     staggered_lift();
     resampler_cadence();
     resampled_gesture();
-    puts("PASS: tap boundaries/no drift, multi-click, movement cancellation/drag, slow scroll precision, fractional fields, distance/direction, time-based velocity, pause/reversal, momentum phases/distance, staggered lift, 60/75/120Hz resampling, USB jitter, scan clock wrap, flush/no drift");
+    puts("PASS: pointer fractions/velocity curve/cadence/reversal/edges, tap boundaries/no drift, multi-click, movement cancellation/drag, slow scroll precision, fractional fields, distance/direction, time-based velocity, pause/reversal, momentum phases/distance, staggered lift, 60/75/120Hz resampling, USB jitter, scan clock wrap, flush/no drift");
     return 0;
 }

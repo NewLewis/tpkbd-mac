@@ -14,7 +14,7 @@ It turns out the touchpad also implements the **standard HID multitouch digitize
 
 | Gesture | Action | Notes |
 |---|---|---|
-| 1-finger move | Pointer | Speed via `TPKB_MOVE_GAIN`; cursor can cross into external displays |
+| 1-finger move | Pointer | Speed-dependent gain with fractional travel; base speed via `TPKB_MOVE_GAIN`; cursor can cross into external displays |
 | 1-finger physical press | Left click | 5-frame debounce, proper double/triple-click counts |
 | Button held + finger move | Drag / text selection | While pressed, all touch becomes drag — scrolling and gestures yield; pointer follows the newest finger (finger-walking); press-sink micro-movement is swallowed (drag slop) |
 | 1-finger tap | Left click | <250 ms and <1.3 mm of travel (libinput's threshold); landing-snap artifacts are filtered; supports double/triple tap |
@@ -68,7 +68,8 @@ Everything is an environment variable in the plist — change and `launchctl boo
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `TPKB_MOVE_GAIN` | 1.8 | Pointer speed multiplier |
+| `TPKB_MOVE_GAIN` | 1.8 | Base pointer gain; the speed curve scales this from 0.5× for precision to 2× for fast travel |
+| `TPKB_MOVE_ACCEL` | 1 | Speed-dependent pointer acceleration; 0 uses fixed gain. Both modes preserve fractional travel |
 | `TPKB_SCROLL_GAIN` | 2.2 | Scroll speed multiplier |
 | `TPKB_SCROLL_SMOOTH_MS` | 12 | Display-paced touch resampling buffer (ms), 0 disables; adds up to the buffer plus one refresh interval of input latency |
 | `TPKB_SCROLL_NATURAL` | 1 | 1 = natural scrolling |

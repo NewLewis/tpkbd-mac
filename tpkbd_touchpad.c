@@ -34,7 +34,8 @@
 //   ./tpkbd_touchpad              驱动模式(需在系统设置授予辅助功能权限)
 //
 // 环境变量调参:
-//   TPKB_MOVE_GAIN    光标移动增益, 默认 1.8
+//   TPKB_MOVE_GAIN    光标基础增益, 默认 1.8 (速度曲线默认 0.5x..2x)
+//   TPKB_MOVE_ACCEL   1=按手速加速(默认), 0=固定倍率; 均保留小数位移
 //   TPKB_SCROLL_GAIN  两指滚动增益(px/px), 默认 2.2
 //   TPKB_SCROLL_NATURAL  1=自然滚动(默认,与 macOS 设置一致), 0=传统方向
 
@@ -56,6 +57,7 @@
 #include <stdatomic.h>
 #include <CoreVideo/CoreVideo.h>
 #include "scroll_resampler.h"
+#include "pointer_motion.h"
 
 #define VID               0x17ef
 #define PID               0x60b5
@@ -70,6 +72,9 @@ static int probe_mode = 0;
 static int debug = 0;
 static int rel_rid = REPORT_ID_RELMOUSE;  // 可由 TPKB_REL_RID 覆盖
 static float move_gain   = 1.8f;
+static int move_acceleration = 1; // TPKB_MOVE_ACCEL=0: 固定倍率, 仍保留小数位移
+static PointerMotion pointer_motion;
+static int pointer_contact_id = -1;
 static float scroll_gain = 2.2f;
 static int   natural     = 1;
 static float rel_gain    = 1.0f;  // 相对模式位移增益
@@ -1420,7 +1425,7 @@ static void handle_report(uint32_t cb_rid, uint8_t *r, CFIndex len) {
             have_last = 0;  // 滚动结束后光标重新锚定
         }
     } else if (!swallow) {
-        // ---- 指针移动: 差分 × 增益 ----
+        // ---- 指针移动: 差分 × 速度增益, 保留小数余量 ----
         // 未按住 = 单指移动; 物理按住期间 = 拖移(滚动/三指分支已让位)。
         // 指针始终跟随最新落下的手指 — 原生触控板的"换指拖移": 按住后
         // 另一指接管指针(选中长文本就靠它), 换跟指当帧只锚定不跳动。
@@ -1431,14 +1436,19 @@ static void handle_report(uint32_t cb_rid, uint8_t *r, CFIndex len) {
             if (tips[i] && down_seq[i] > sseq) { sseq = down_seq[i]; s = i; }
         if (s >= 0) {
             int suppress = 0;
-            if (!have_last || move_slot != s) {
+            uint64_t pointer_now = mach_ns();
+            uint16_t pointer_scan = r[26] | (r[27] << 8);
+            if (!have_last || move_slot != s || pointer_contact_id != contact_id[s]) {
                 // 新按下/换跟踪指: 仅锚定, 不跳动
                 if (debug) fprintf(stderr, "[tpkbd] MV anchor slot=%d pad=(%d,%d) cur=(%.0f,%.0f)\n",
                                    s, fx[s], fy[s], cur.x, cur.y);
                 mv_slop_done = 0;
                 mv_frames = 0;
                 snap_done = 0;
+                pointer_motion_anchor(&pointer_motion, fx[s], fy[s], pointer_scan, pointer_now);
             } else {
+                // 速度取相邻原始报文, 不能用死区累计距离除以一帧时间。
+                pointer_motion_observe(&pointer_motion, fx[s], fy[s], pointer_scan, pointer_now);
                 int disp = abs(fx[s] - last_px) + abs(fy[s] - last_py);
                 mv_frames++;
                 if (!btn_prev && !click && !mv_slop_done && !tap_pointer_moved &&
@@ -1453,6 +1463,7 @@ static void handle_report(uint32_t cb_rid, uint8_t *r, CFIndex len) {
                     tap_anchor_x = fx[s]; tap_anchor_y = fy[s];
                     tap_moved = 0;
                     last_px = fx[s]; last_py = fy[s];
+                    pointer_motion_anchor(&pointer_motion, fx[s], fy[s], pointer_scan, pointer_now);
                     suppress = 1;
                     if (debug) fprintf(stderr, "[tpkbd] SNAP %d counts @frame %d, re-anchored\n",
                                        disp, mv_frames);
@@ -1463,6 +1474,7 @@ static void handle_report(uint32_t cb_rid, uint8_t *r, CFIndex len) {
                     if (abs(fx[s] - drag_ax) + abs(fy[s] - drag_ay) < drag_slop) {
                         suppress = 1;
                         last_px = fx[s]; last_py = fy[s];   // 静默重锚
+                        pointer_motion_anchor(&pointer_motion, fx[s], fy[s], pointer_scan, pointer_now);
                         if (debug) fprintf(stderr, "[tpkbd] DRAG slop d=(%d,%d) swallowed\n",
                                            fx[s] - drag_ax, fy[s] - drag_ay);
                     } else {
@@ -1482,13 +1494,20 @@ static void handle_report(uint32_t cb_rid, uint8_t *r, CFIndex len) {
                     }
                 }
                 if (!suppress) {
-                    int nx = last_sx + (int)((fx[s] - last_px) * move_gain);
-                    int ny = last_sy + (int)((fy[s] - last_py) * move_gain);
+                    int pdx, pdy;
+                    pointer_motion_apply(&pointer_motion, fx[s] - last_px, fy[s] - last_py,
+                                         move_gain, move_acceleration, &pdx, &pdy);
+                    int nx = last_sx + pdx;
+                    int ny = last_sy + pdy;
+                    int intended_x = nx, intended_y = ny;
                     if (debug) fprintf(stderr, "[tpkbd] MV slot=%d pad=(%d,%d) last=(%d,%d) d=(%d,%d) -> (%d,%d)\n",
                                        s, fx[s], fy[s], last_px, last_py,
                                        fx[s]-last_px, fy[s]-last_py, nx, ny);
                     clamp_to_screen(&nx, &ny);
                     avoid_gap(&nx, &ny, last_sx, last_sy);
+                    // 屏幕边缘被挡下的分数不能累积成返程时的额外位移。
+                    if (nx != intended_x) pointer_motion.remainder_x = 0;
+                    if (ny != intended_y) pointer_motion.remainder_y = 0;
                     if (nx != (int)cur.x || ny != (int)cur.y) {
                         tap_pointer_moved = 1;
                         tap_moved = 1;
@@ -1496,16 +1515,19 @@ static void handle_report(uint32_t cb_rid, uint8_t *r, CFIndex len) {
                     // 按住期间必须发 Dragged 而非 Moved: 按下时板面下沉, 触点
                     // 天然有微小位移, 若在 Down/Up 之间插入 Moved, App 的点击
                     // 跟踪会取消该次点击(表现为"点按偶尔不灵")。
-                    if (btn_prev) {
-                        if (btn_type) post_right_drag(CGPointMake(nx, ny));
-                        else          post_mouse_drag(CGPointMake(nx, ny));
-                    } else {
-                        post_mouse_move(CGPointMake(nx, ny));
+                    if (nx != last_sx || ny != last_sy) {
+                        if (btn_prev) {
+                            if (btn_type) post_right_drag(CGPointMake(nx, ny));
+                            else          post_mouse_drag(CGPointMake(nx, ny));
+                        } else {
+                            post_mouse_move(CGPointMake(nx, ny));
+                        }
                     }
                     cur.x = nx; cur.y = ny;
                 }
             }
             move_slot = s;
+            pointer_contact_id = contact_id[s];
             if (!suppress) { last_px = fx[s]; last_py = fy[s]; }  // 死区抑制期间保持锚点
             last_sx = (int)cur.x; last_sy = (int)cur.y;
             have_last = 1;
@@ -1539,7 +1561,11 @@ static void handle_report(uint32_t cb_rid, uint8_t *r, CFIndex len) {
                 int fs = -1, fseq = 0;
                 for (int i = 0; i < NFINGER; i++)
                     if (tips[i] && down_seq[i] > fseq) { fseq = down_seq[i]; fs = i; }
-                if (fs >= 0) { drag_armed = 1; drag_ax = fx[fs]; drag_ay = fy[fs]; }
+                if (fs >= 0) {
+                    drag_armed = 1; drag_ax = fx[fs]; drag_ay = fy[fs];
+                    pointer_motion_anchor(&pointer_motion, fx[fs], fy[fs],
+                                          r[26] | (r[27] << 8), mach_ns());
+                }
             }
             btn_prev = 1;
         }
@@ -1692,7 +1718,11 @@ int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "--capture") == 0) return run_capture();
 
     const char *env;
-    if ((env = getenv("TPKB_MOVE_GAIN"))    != NULL) move_gain   = atof(env);
+    if ((env = getenv("TPKB_MOVE_GAIN"))    != NULL) {
+        double value = strtod(env, NULL);
+        if (isfinite(value) && value > 0 && value <= 20) move_gain = value;
+    }
+    if ((env = getenv("TPKB_MOVE_ACCEL"))   != NULL) move_acceleration = atoi(env) != 0;
     if ((env = getenv("TPKB_SCROLL_GAIN"))  != NULL) scroll_gain = atof(env);
     if ((env = getenv("TPKB_SCROLL_NATURAL")) != NULL) natural    = atoi(env);
     if ((env = getenv("TPKB_MOMENTUM"))      != NULL) momentum_on = atoi(env);
@@ -1739,6 +1769,10 @@ int main(int argc, char **argv) {
         double value = strtod(env, NULL);
         if (isfinite(value) && value >= 0 && value <= 40) scroll_smooth_ms = value;
     }
+    fprintf(stderr, "[tpkbd] 指针: 速度加速=%s, 增益=%.2f (慢速%.2f / 快速%.2f), 小数位移累积\n",
+            move_acceleration ? "开" : "关", move_gain,
+            pointer_motion_gain(0, move_gain, move_acceleration),
+            pointer_motion_gain(1500, move_gain, move_acceleration));
     scroll_frames_init();
     hid_api_init();
     update_display_bounds();

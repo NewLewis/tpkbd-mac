@@ -14,7 +14,7 @@ ThinkPad X1 Tablet Thin Keyboard Gen 3（Chicony 代工，USB VID `17ef` PID `60
 
 | 手势 | 功能 | 说明 |
 |---|---|---|
-| 单指移动 | 光标 | 速度 `TPKB_MOVE_GAIN` 可调；可跨到外接扩展屏 |
+| 单指移动 | 光标 | 按手速平滑加速、保留小数位移；基础速度 `TPKB_MOVE_GAIN` 可调；可跨到外接扩展屏 |
 | 单指按压 | 左键 | 松开 5 帧消抖；双击选词/三击选段正常 |
 | 按住不放 + 移动（任意指数） | 拖移 / 选中文本 | 按住期间触摸全部变拖移，滚动/手势让位；指针跟随最新落下的手指，可换指接力；按压沉陷微移被吞（drag slop，点击干净） |
 | 单指轻点 | 左键 | <250ms 且位移 <1.3mm（取 libinput 阈值）才算点；落板跳变伪影已滤除；支持双击/三击连击 |
@@ -68,7 +68,8 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.pjr.tpkbd-touchpad.p
 
 | 变量 | 默认 | 含义 |
 |---|---|---|
-| `TPKB_MOVE_GAIN` | 1.8 | 光标速度倍率 |
+| `TPKB_MOVE_GAIN` | 1.8 | 光标基础倍率；速度曲线从慢移 0.5× 平滑提高到快移 2×，默认实际约 0.9～3.6 |
+| `TPKB_MOVE_ACCEL` | 1 | 按手速加速；0 使用固定倍率。两种模式都保留小数位移 |
 | `TPKB_SCROLL_GAIN` | 2.2 | 滚动速度倍率 |
 | `TPKB_SCROLL_SMOOTH_MS` | 12 | 按屏幕刷新重采样的缓冲时长(ms)，0 关闭；增加的输入延迟上限约为缓冲加一个刷新周期 |
 | `TPKB_SCROLL_NATURAL` | 1 | 1=自然滚动 |
