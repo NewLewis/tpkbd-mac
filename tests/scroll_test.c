@@ -20,8 +20,10 @@ typedef struct { int phase; double delta; CGPoint point; } PinchSample;
 static PinchSample pinch_samples[4096];
 static int pinch_count;
 static CGPoint test_cursor = {500, 500};
+static int stale_cursor_reads;
 static CGPoint test_event_location(CGEventRef event) {
-    return CGEventGetType(event) == kCGEventNull ? test_cursor : CGEventGetLocation(event);
+    return CGEventGetType(event) == kCGEventNull ?
+        (stale_cursor_reads ? CGPointMake(500, 500) : test_cursor) : CGEventGetLocation(event);
 }
 static void capture_event(CGEventTapLocation tap, CGEventRef event) {
     (void)tap;
@@ -67,6 +69,11 @@ static void reset(void) {
     touch_resampling = 0;
     pinch_active = pinch_sent = pinch_tail = 0;
     pinch_on = 0; pinch_gain = 1;
+    drag3_on = 0; three_drag = (ThreeFingerDrag){0};
+    three_drag_cursor = CGPointZero; stale_cursor_reads = 0;
+    system_swipe_tail = 0;
+    swipe3_active = swipe3_sent = swipe3_axis = 0;
+    swipe3_resend_cancel();
     two_finger = (TwoFingerGesture){0};
     scroll_smooth_ms = 0;
     mom_stop();
@@ -636,7 +643,195 @@ static void pinch_gestures(void) {
     assert(!pinch_active && pinch_samples[pinch_count - 1].phase == PH_CANCELLED);
 }
 
+static void contacts_report(const DragContact *contacts, int count, int click) {
+    uint8_t r[30] = {3};
+    for (int i = 0; i < count; i++) {
+        r[1 + i * 5] = 3 | (contacts[i].id << 2);
+        r[2 + i * 5] = contacts[i].x & 255; r[3 + i * 5] = contacts[i].x >> 8;
+        r[4 + i * 5] = contacts[i].y & 255; r[5 + i * 5] = contacts[i].y >> 8;
+    }
+    test_time_ms += 10;
+    uint16_t scan = (uint16_t)(uint64_t)(test_time_ms * 10);
+    r[26] = scan & 255; r[27] = scan >> 8;
+    r[28] = count; r[29] = click;
+    handle_report(3, r, sizeof(r));
+}
+
+static void group_report(int count, int dx, int dy, int click) {
+    DragContact contacts[NFINGER];
+    for (int i = 0; i < count; i++) contacts[i] = (DragContact){i, 300 + i * 100 + dx, 400 + dy};
+    contacts_report(contacts, count, click);
+}
+
+static void start_drag(void) {
+    group_report(3, 0, 0, 0);
+    for (int i = 1; i <= 6; i++) group_report(3, i * 4, 0, 0);
+    assert(three_drag.phase == DRAG3_ACTIVE && !btn_prev && !swipe3_active);
+    assert(mouse_samples[0].type == kCGEventLeftMouseDown && mouse_samples[0].count == 1);
+    for (int i = 1; i < mouse_count; i++) assert(mouse_samples[i].type == kCGEventLeftMouseDragged);
+}
+
+static void three_finger_dragging(void) {
+    // The same Down -> Dragged -> Up stream selects text and drags files or
+    // windows. No physical button is needed; a preceding click is not doubled.
+    reset(); drag3_on = swipe3_on = 1; move_gain = 1; move_acceleration = 0;
+    click_count = 3; last_down_ms = now_ms();
+    start_drag();
+    assert(test_cursor.x == 524 && test_cursor.y == 500);
+    group_report(3, 30, 12, 0);
+    assert(test_cursor.x == 530 && test_cursor.y == 512);
+    group_report(2, 90, 60, 0);
+    assert(mouse_samples[mouse_count - 1].type == kCGEventLeftMouseUp);
+    assert(test_cursor.x == 530 && test_cursor.y == 512);
+    int count = mouse_count;
+    group_report(1, 150, 80, 0);
+    group_report(2, 150, 80, 0);
+    group_report(3, 150, 80, 0);
+    group_report(0, 0, 0, 0);
+    assert(mouse_count == count && three_drag.phase == DRAG3_IDLE);
+    assert(pinch_count == 0 && !scroll_active && !mom_active);
+    for (int i = 0; i < sample_count; i++) assert(!samples[i].x && !samples[i].y);
+
+    reset(); drag3_on = 1; move_gain = 1; move_acceleration = 0; stale_cursor_reads = 1;
+    start_drag();
+    assert(test_cursor.x == 524);
+    group_report(0, 0, 0, 0);
+    assert(mouse_samples[mouse_count - 1].point.x == 524);
+
+    // A stationary three-finger touch, including staggered lift, cannot click.
+    reset(); drag3_on = swipe3_on = tap_on = 1;
+    for (int i = 0; i < 20; i++) group_report(3, i % 2, i % 2, 0);
+    group_report(2, 10, 0, 0); group_report(1, 30, 0, 0); group_report(0, 0, 0, 0);
+    assert(mouse_count == 0 && pinch_count == 0 && !swipe3_sent);
+
+    // A settling jump followed by rest cannot press the mouse; after settling,
+    // real travel starts from the new contact positions without replaying it.
+    reset(); drag3_on = 1; move_gain = 1; move_acceleration = 0;
+    group_report(3, 0, 0, 0); group_report(3, 18, 12, 0);
+    for (int i = 0; i < 8; i++) group_report(3, 18, 12, 0);
+    assert(mouse_count == 0);
+    for (int i = 1; i <= 6; i++) group_report(3, 18 + i * 4, 12, 0);
+    assert(test_cursor.x == 524 && test_cursor.y == 500);
+    group_report(0, 0, 0, 0);
+    reset(); drag3_on = 1; move_gain = 1; move_acceleration = 0;
+    group_report(3, 0, 0, 0);
+    for (int i = 1; i <= 50; i++) group_report(3, i / 3, 0, 0);
+    assert(three_drag.phase == DRAG3_ACTIVE && test_cursor.x == 516);
+    group_report(0, 0, 0, 0);
+
+    // Reordering report slots preserves contact identities. A replaced contact
+    // reanchors without jumping, while subsequent motion remains a drag.
+    reset(); drag3_on = swipe3_on = 1; move_gain = 1; move_acceleration = 0;
+    start_drag(); count = mouse_count;
+    DragContact reordered[] = {{2,524,400},{0,324,400},{1,424,400}};
+    contacts_report(reordered, 3, 0);
+    assert(mouse_count == count && test_cursor.x == 524);
+    reordered[0] = (DragContact){6,1000,650};
+    contacts_report(reordered, 3, 0);
+    assert(mouse_count == count && test_cursor.x == 524);
+    for (int i = 0; i < 3; i++) { reordered[i].x += 2; reordered[i].y -= 1; }
+    contacts_report(reordered, 3, 0);
+    assert(test_cursor.x == 526 && test_cursor.y == 499);
+    group_report(0, 0, 0, 0);
+
+    // Sub-count centroid motion accumulates instead of being truncated, and
+    // an added fourth finger cannot steal a drag for a desktop gesture.
+    reset(); drag3_on = swipe3_on = 1; move_acceleration = 0;
+    start_drag(); double before = test_cursor.x;
+    DragContact precise[] = {{0,324,400},{1,424,400},{2,524,400}};
+    for (int i = 0; i < 30; i++) { precise[0].x++; contacts_report(precise, 3, 0); }
+    assert(test_cursor.x - before == 18);
+    group_report(0, 0, 0, 0);
+    reset(); drag3_on = swipe3_on = 1; move_gain = 1; move_acceleration = 0;
+    start_drag();
+    group_report(4, 30, 0, 0); group_report(4, 40, 0, 0);
+    assert(test_cursor.x == 540 && !swipe3_active);
+    group_report(3, 45, 0, 1); // Accidental pressure still belongs to the drag.
+    assert(!btn_prev && test_cursor.x == 545);
+    group_report(0, 0, 0, 0);
+    int downs = 0, ups = 0;
+    for (int i = 0; i < mouse_count; i++) {
+        downs += mouse_samples[i].type == kCGEventLeftMouseDown;
+        ups += mouse_samples[i].type == kCGEventLeftMouseUp;
+        assert(mouse_samples[i].type != kCGEventRightMouseDown);
+    }
+    assert(downs == 1 && ups == 1);
+
+    // Three-finger sums must not make the pointer speed look three times faster.
+    for (int fast = 0; fast < 2; fast++) {
+        reset(); drag3_on = 1;
+        screen_bounds.size.width = g_display_bounds[0].size.width = 10000;
+        group_report(3, 0, 0, 0);
+        for (int i = 1; i <= 50; i++) group_report(3, i * (fast ? 15 : 1), 0, 0);
+        group_report(0, 0, 0, 0);
+        assert(test_cursor.x == 500 + (fast ? 2700 : 45));
+    }
+
+    // New touches during typing are ignored; an already active drag survives
+    // typing. Losing the device or stopping the daemon releases its button once.
+    reset(); drag3_on = 1; typelock_ms = 500; last_key_ms = now_ms();
+    for (int i = 0; i < 10; i++) group_report(3, i * 10, 0, 0);
+    assert(mouse_count == 0 && three_drag.phase == DRAG3_IDLE);
+    reset(); drag3_on = 1;
+    start_drag(); typelock_ms = 500; last_key_ms = now_ms(); type_grandf = touch_now;
+    group_report(3, 40, 0, 0);
+    assert(three_drag.phase == DRAG3_ACTIVE && mouse_samples[mouse_count - 1].type == kCGEventLeftMouseDragged);
+    device_detached(NULL, 0, NULL, NULL);
+    assert(three_drag.phase == DRAG3_IDLE && mouse_samples[mouse_count - 1].type == kCGEventLeftMouseUp);
+    count = mouse_count; release_pointer_buttons(); assert(mouse_count == count);
+    reset(); drag3_on = 1; start_drag();
+    release_pointer_buttons();
+    assert(three_drag.phase == DRAG3_IDLE && mouse_samples[mouse_count - 1].type == kCGEventLeftMouseUp);
+
+    // Physical index-button + middle-finger dragging has priority, even if a
+    // third/fourth finger lands. Release must not be swallowed by gesture code.
+    for (int fingers = 3; fingers <= 4; fingers++) {
+        reset(); drag3_on = swipe3_on = 1;
+        pointer_report(1, 300, 400, 0, 0); pointer_report(1, 300, 400, 1, 0);
+        for (int i = 0; i < 8; i++) group_report(fingers, i * 10, 0, 1);
+        assert(btn_prev && three_drag.phase == DRAG3_IDLE && !swipe3_active);
+        for (int i = 0; i < 8; i++) group_report(fingers, 70, 0, 0);
+        assert(!btn_prev && three_drag.phase == DRAG3_TAIL);
+        assert(mouse_samples[mouse_count - 1].type == kCGEventLeftMouseUp);
+        count = mouse_count; group_report(0, 0, 0, 0); assert(mouse_count == count);
+    }
+}
+
+static void four_finger_swiping(void) {
+    for (int vertical = 0; vertical < 2; vertical++) {
+        reset(); drag3_on = swipe3_on = 1;
+        group_report(1, 0, 0, 0); group_report(2, 0, 0, 0);
+        group_report(3, 0, 0, 0);
+        group_report(3, vertical ? 0 : 20, vertical ? 20 : 0, 0);
+        assert(three_drag.phase == DRAG3_PENDING && mouse_count == 0);
+        group_report(4, 20, 20, 0);
+        assert(swipe3_active && three_drag.phase == DRAG3_IDLE);
+        group_report(4, vertical ? 20 : 40, vertical ? 40 : 20, 0);
+        group_report(4, vertical ? 20 : 60, vertical ? 60 : 20, 0);
+        assert(swipe3_sent && swipe3_axis == (vertical ? 2 : 1));
+        group_report(3, 100, 100, 0);
+        assert(!swipe3_active && system_swipe_tail);
+        for (int i = 0; i < 10; i++) group_report(3, 150 + i * 10, 100, 0);
+        group_report(2, 250, 100, 0); group_report(1, 300, 100, 0); group_report(0, 0, 0, 0);
+        assert(mouse_count == 0 && pinch_count == 0 && !system_swipe_tail);
+        assert(three_drag.phase == DRAG3_IDLE && test_cursor.x == 500 && test_cursor.y == 500);
+    }
+    reset(); drag3_on = 0; swipe3_on = 1;
+    group_report(3, 0, 0, 0); group_report(3, 20, 0, 0); group_report(3, 40, 0, 0);
+    assert(swipe3_active && swipe3_sent && three_drag.phase == DRAG3_IDLE);
+    group_report(0, 0, 0, 0);
+    assert(!swipe3_active && mouse_count == 0);
+
+    reset(); drag3_on = 1; swipe3_on = 0;
+    group_report(4, 0, 0, 0); group_report(4, 100, 100, 0);
+    for (int i = 0; i < 10; i++) group_report(3, 100 + i * 10, 100, 0);
+    group_report(0, 0, 0, 0);
+    assert(mouse_count == 0 && sample_count == 0 && !system_swipe_tail);
+}
+
 int main(void) {
+    three_finger_dragging();
+    four_finger_swiping();
     pinch_gestures();
     pointer_precision_and_acceleration();
     tap_no_drift();
@@ -647,6 +842,6 @@ int main(void) {
     staggered_lift();
     resampler_cadence();
     resampled_gesture();
-    puts("PASS: pinch ratios/phases/arbitration/jitter/contact changes/drag priority, pointer fractions/velocity curve/cadence/reversal/edges, tap boundaries/no drift, multi-click, movement cancellation/drag, slow scroll precision, fractional fields, distance/direction, time-based velocity, pause/reversal, momentum phases/distance, staggered lift, 60/75/120Hz resampling, USB jitter, scan clock wrap, flush/no drift");
+    puts("PASS: three-finger drag/selection/button ownership/identity/fractions/typing/release, four-finger swipes/arbitration/tails/legacy mode, pinch ratios/phases/arbitration/jitter/contact changes/drag priority, pointer fractions/velocity curve/cadence/reversal/edges, tap boundaries/no drift, multi-click, movement cancellation/drag, slow scroll precision, fractional fields, distance/direction, time-based velocity, pause/reversal, momentum phases/distance, staggered lift, 60/75/120Hz resampling, USB jitter, scan clock wrap, flush/no drift");
     return 0;
 }

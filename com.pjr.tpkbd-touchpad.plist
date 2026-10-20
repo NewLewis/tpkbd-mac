@@ -27,6 +27,11 @@
 		<string>2.2</string>
 		<key>TPKB_SCROLL_NATURAL</key>
 		<string>1</string>
+		<!-- 三指拖移开启后，桌面/调度中心手势改用四指 -->
+		<key>TPKB_DRAG3</key>
+		<string>1</string>
+		<key>TPKB_SWIPE3</key>
+		<string>1</string>
 		<key>TPKB_TAP</key>
 		<string>session</string>
 		<key>TPKB_DEBUG</key>

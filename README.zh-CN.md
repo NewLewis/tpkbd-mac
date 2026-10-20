@@ -22,8 +22,9 @@ ThinkPad X1 Tablet Thin Keyboard Gen 3（Chicony 代工，USB VID `17ef` PID `60
 | 双指甩动 | 惯性滚动 | 移植 Mac Mouse Fix 的触控板物理曲线 |
 | 双指捏合 / 张开 | 缩小 / 放大 | 原生缩放事件，需应用支持；同一次接触锁定滚动或缩放，抬指后可切换 |
 | 双指按压 | 右键 | 双指轻点=右键默认关（易误触），`TPKB_TAP_RIGHT=1` 可打开 |
-| 三指左右滑 | 切换桌面空间 / 全屏应用 | 跟手、回拉取消、按空间数自适应缩放 |
-| 三指上滑 / 下滑 | 调度中心 / App Exposé | |
+| 三指移动 | 拖移 / 选中文字 | 无需按压；从当前光标位置开始，少于三指时松开；残留指不会误滚动或移动光标 |
+| 四指左右滑 | 切换桌面空间 / 全屏应用 | 跟手、回拉取消、按空间数自适应缩放 |
+| 四指上滑 / 下滑 | 调度中心 / App Exposé | 全部抬指后再开始拖移 |
 | 打字中 | 触摸板锁定 500ms | libinput 式 disable-while-typing；在板手势放行、按住的键不卡死 |
 | Win ↔ Alt 键 | 互换为 Option / Command | 对齐 Mac 底排排列，经 `hidutil` **只对本键盘**生效 |
 | 按住中键 + 拨小红点 | 丝滑滚动 | 经典 ThinkPad 滚动（带惯性）；期间光标会小幅漂移（已知限制，见疑难排查）；中键单击默认无动作，`TPKB_TP_CLICK` 可配 |
@@ -32,7 +33,7 @@ ThinkPad X1 Tablet Thin Keyboard Gen 3（Chicony 代工，USB VID `17ef` PID `60
 
 ## 环境要求
 
-- macOS 26 及以上。仅在 **macOS 27.0.1 / Apple Silicon** 上实测过。（三指调度中心/切空间用的是 macOS 27 的 IOHIDEvent 通道；旧系统需要 Mac Mouse Fix 里的 pre-27 变体。）
+- macOS 26 及以上。仅在 **macOS 27.0.1 / Apple Silicon** 上实测过。（调度中心/切空间用的是 macOS 27 的 IOHIDEvent 通道；旧系统需要 Mac Mouse Fix 里的 pre-27 变体。）
 - Xcode 命令行工具（`xcode-select --install`）。
 - 键盘以 USB 连接。
 
@@ -81,8 +82,9 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.pjr.tpkbd-touchpad.p
 | `TPKB_DRAG_SLOP` | 12 | 按下瞬间的拖移抑制阈值（传感器 counts）：按压沉陷的微移被吞掉、点击保持干净（截图选窗等依赖）；0 关闭 |
 | `TPKB_MOVE_SLOP` | 14 | 落指死区（传感器 counts）≈ libinput 的 1.3mm 轻点位移阈值：轻点与移动共用每轴闭区间，避免微移既移动又点击；越阈后一次性补发累计位移 |
 | `TPKB_TAP_MS` | 250 | 轻点最长时长(ms) |
-| `TPKB_SWIPE3` | 1 | 三指手势 |
-| `TPKB_SWIPE3_GAIN` | 1.0 | 三指滑动速度 |
+| `TPKB_DRAG3` | 1 | 三指拖移与选字；设为 0 恢复原来的三指桌面手势 |
+| `TPKB_SWIPE3` | 1 | 桌面手势开关，沿用旧配置名；开启三指拖移后使用四指 |
+| `TPKB_SWIPE3_GAIN` | 1.0 | 桌面手势滑动速度（三指/四指共用） |
 | `TPKB_TYPELOCK_MS` | 500 | 打字锁定窗口, 0=关 |
 | `TPKB_SWAP_WINALT` | 1 | Win↔Alt 互换 |
 | `TPKB_TP_SCROLL` | 1 | 小红点中键滚动开关 |
@@ -96,7 +98,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.pjr.tpkbd-touchpad.p
 1. **模式切换**：设备接入后，守护进程向鼠标接口发标准 HID Input Mode Feature 报文（reportID 4、值 3），固件即改发多点触控 digitizer 报文（`0x03`）代替相对鼠标报文。该设置跨重插保持。坑：Feature buffer 必须是 `[reportID, value]`，只发 payload 返回成功但什么都不改。
 2. **报文解析**：30 字节 = 5 指位 × 5 字节（confidence/tip/contact-id 标志位 + 16 位 X∈[0,1163]、Y∈[0,718]）+ scan time + 接触计数 + 物理按压位。细节与解码方法论在源码注释和 [docs/devlog.md](docs/devlog.md)。
 3. **事件合成**（最有意思的部分）：直接发像素滚动事件，各 App 会当鼠标滚轮自己再做一层加速——这就是第三方触摸板工具"卡卡的"根源。原生触控板手感来自**手势相位事件流**：MayBegin→Began→Changed→Ended 的连续滚动事件，每个配一个 type-29 手势事件（Safari 回弹依赖它），抬指后再接动量相位流。惯性物理（`v' = −a·v^b`，a=30、b=0.7）、相位语义、整套方案**移植自 [Mac Mouse Fix](https://github.com/noah-nuebling/mac-mouse-fix)**。
-4. **系统级手势**：三指滑动构造私有 `IOHIDEvent`（type 23 DockSwipe），带 motion/flavor/progress 字段、velocity 子事件、type-30 CGEvent 载体——与 MMF 在 macOS 27 的做法一致。切空间缩放经私有 CGS API 按空间数自适应；结束事件 200/500ms 后重发一次，规避系统偶发的手势卡死 bug。
+4. **拖移与系统级手势**：三指拖移发送左键按下、拖动、松开事件，复用指针速度曲线并保留三指质心的小数位移；轻触静止不会点击，接触换槽/换 ID 时重锚。四指滑动构造私有 `IOHIDEvent`（type 23 DockSwipe），带 motion/flavor/progress 字段、velocity 子事件、type-30 CGEvent 载体——与 MMF 在 macOS 27 的做法一致。切空间缩放经私有 CGS API 按空间数自适应；结束事件 200/500ms 后重发一次，规避系统偶发的手势卡死 bug。手势确定后锁定到抬指，避免三指拖移与四指滑动互相抢占。
 5. **其余**：光标钳制用全部屏幕的联合矩形（只钳主屏会把光标困死在主屏）；打字锁定是 ListenOnly keyDown tap 实现的 libinput DWT 语义；Win↔Alt 互换经 `hidutil` 按 VID/PID 匹配、只影响这一把键盘。
 
 完整逆向过程（包括烧掉两个调试会话的报文布局大坑）见 [docs/devlog.md](docs/devlog.md)。
@@ -113,7 +115,8 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.pjr.tpkbd-touchpad.p
 
 ## 已知限制
 
-- 无三指拖移、无压力感应（硬件无压感）。
+- 三指拖移在不足三指时松开鼠标，没有拖移锁定或全抬指续拖；下一轮手势需先全部抬指。
+- 无压力感应（硬件无压感）。
 - 打字锁定在 Secure Input 会话（密码框）内不生效——系统对 event tap 隐藏按键。
 - 只在一把键盘固件 + 一个 macOS 版本上实测。报文 ID 与布局是该设备的实证常量，不同固件可能不同。
 

@@ -60,6 +60,7 @@
 #include "pointer_motion.h"
 #include "two_finger_gesture.h"
 #include "magnify_event.h"
+#include "three_finger_drag.h"
 
 #define VID               0x17ef
 #define PID               0x60b5
@@ -397,6 +398,12 @@ static size_t scroll_trace_count = 0;
 static uint64_t scroll_trace_start = 0;
 static uint64_t scroll_trace_duration = 30000000000ULL;
 static volatile sig_atomic_t scroll_trace_requested = 0;
+static volatile sig_atomic_t driver_stop_requested = 0;
+
+static void driver_stop_signal(int signo) {
+    (void)signo;
+    driver_stop_requested = 1;
+}
 
 static void scroll_trace_signal(int signo) {
     scroll_trace_requested = signo == SIGUSR2 ? 2 : 1;
@@ -490,6 +497,7 @@ static void pinch_trace_stop(void) {
 
 static void scroll_trace_control(CFRunLoopTimerRef timer, void *context) {
     (void)timer; (void)context;
+    if (driver_stop_requested) { CFRunLoopStop(CFRunLoopGetMain()); return; }
     if (scroll_trace_requested) {
         int request = scroll_trace_requested;
         scroll_trace_requested = 0;
@@ -1187,7 +1195,11 @@ static void post_dock_swipe_event(int phase, int motion_type, double stored_prog
     CFRelease(ev);
 }
 
-// 三指手势状态
+// 桌面手势沿用旧的 swipe3 名称与配置; 三指拖移开启时改由四指触发。
+static int drag3_on = 1;                     // TPKB_DRAG3
+static ThreeFingerDrag three_drag;
+static CGPoint three_drag_cursor;
+static int system_swipe_tail = 0;
 static int    swipe3_on = 1;                 // TPKB_SWIPE3
 static double swipe3_gain = 1.0;             // TPKB_SWIPE3_GAIN 速度倍率
 static int    swipe3_active = 0;             // 三指在板
@@ -1232,6 +1244,7 @@ static double swipe3_scale_compute(void) {
 }
 
 static void swipe3_begin(int cx, int cy) {
+    swipe3_resend_cancel();
     swipe3_sent = 0;
     swipe3_axis = 0;
     swipe3_origin = 0;
@@ -1279,12 +1292,12 @@ static void swipe3_move(int cx, int cy) {
                        swipe3_axis, d, swipe3_origin, stored);
 }
 
-static void swipe3_end(void) {
+static void swipe3_end(int cancelled) {
     if (!swipe3_active) return;
     swipe3_active = 0;
     if (swipe3_sent && swipe3_axis) {
         // 末帧方向与总位移同号 → Ended, 反号(回拉取消) → Cancelled (MMF 规则)
-        int end_phase = PH_ENDED;
+        int end_phase = cancelled ? PH_CANCELLED : PH_ENDED;
         if (swipe3_origin != 0 && swipe3_last_d != 0 &&
             (swipe3_last_d > 0) != (swipe3_origin > 0)) end_phase = PH_CANCELLED;
         double exit_speed = swipe3_last_d * 100.0;
@@ -1304,6 +1317,21 @@ static CGPoint cursor_pos(void) {
     return p;
 }
 
+static void three_drag_release(void) {
+    if (three_drag.phase == DRAG3_ACTIVE) post_click(three_drag_cursor, 0, 1);
+    three_drag = (ThreeFingerDrag){0};
+}
+
+static void release_pointer_buttons(void) {
+    three_drag_release();
+    if (btn_prev) {
+        if (btn_type) post_right_click(cursor_pos(), 0, 1);
+        else post_click(cursor_pos(), 0, click_count);
+    }
+    if (rel_btn_prev) post_click(cursor_pos(), 0, 1);
+    btn_prev = rel_btn_prev = release_streak = drag_armed = 0;
+}
+
 static void clamp_to_screen(int *x, int *y) {
     if (*x < screen_bounds.origin.x) *x = (int)screen_bounds.origin.x;
     if (*y < screen_bounds.origin.y) *y = (int)screen_bounds.origin.y;
@@ -1311,6 +1339,50 @@ static void clamp_to_screen(int *x, int *y) {
         *x = (int)(screen_bounds.origin.x + screen_bounds.size.width  - 1);
     if (*y > screen_bounds.origin.y + screen_bounds.size.height - 1)
         *y = (int)(screen_bounds.origin.y + screen_bounds.size.height - 1);
+}
+
+static int handle_three_drag(const DragContact *contacts, int count,
+                              uint16_t scan, int swallow, int click) {
+    Drag3Output out = drag3_update(&three_drag, contacts, count, scan, mach_ns(),
+                                  drag3_on, swallow || btn_prev, click,
+                                  move_gain, move_acceleration);
+    if (!out.consume) return 0;
+    if (scroll_active) {
+        scrl_ema_x = scrl_ema_y = 0;
+        end_scroll_gesture();
+        scroll_active = 0;
+    }
+    two_finger.mode = TWO_NONE;
+    have_last = 0;
+    tap_moved = tap_pointer_moved = 1;
+    touch_now = swallow ? 0 : count > 0;
+    // CGEventPost is asynchronous. Integrate from our last posted position,
+    // otherwise 140Hz reports can read an older system cursor and lose travel.
+    CGPoint cur = three_drag_cursor;
+    if (out.begin) {
+        // Dragging always selects from the current position, never as the
+        // second/third click in a preceding click sequence.
+        last_down_ms = 0;
+        cur = cursor_pos();
+        post_click(cur, 1, 1);
+    }
+    if (out.dx || out.dy) {
+        int x = (int)cur.x + out.dx, y = (int)cur.y + out.dy;
+        int intended_x = x, intended_y = y;
+        clamp_to_screen(&x, &y);
+        avoid_gap(&x, &y, (int)cur.x, (int)cur.y);
+        if (x != intended_x) three_drag.motion.remainder_x = 0;
+        if (y != intended_y) three_drag.motion.remainder_y = 0;
+        if (x != (int)cur.x || y != (int)cur.y) post_mouse_drag(CGPointMake(x, y));
+        cur = CGPointMake(x, y);
+    }
+    three_drag_cursor = cur;
+    if (out.end) post_click(cur, 0, 1);
+    if (!count) {
+        tap_active = tap_nfid = 0;
+        type_grandf = 0;
+    }
+    return 1;
 }
 
 // 相对位移: 在当前光标位置上叠加 (dx,dy)
@@ -1460,6 +1532,45 @@ static void handle_report(uint32_t cb_rid, uint8_t *r, CFIndex len) {
         pinch_finish(ntips >= 3 || click || btn_prev || swallow || !pinch_on);
         pinch_tail = ntips == 1;
     }
+
+    int swipe_fingers = drag3_on ? 4 : 3;
+    if (swipe3_active && (ntips < swipe_fingers || !swipe3_on ||
+                          swallow || click || btn_prev)) {
+        swipe3_end(!swipe3_on || swallow || click || btn_prev);
+        system_swipe_tail = ntips > 0 || click;
+    }
+    // A four-finger lift passes through three/two/one contacts. Those tail
+    // reports belong to the swipe, not to a new drag, zoom or scroll.
+    if (system_swipe_tail) {
+        have_last = 0;
+        tap_moved = tap_pointer_moved = 1;
+        touch_now = swallow ? 0 : ntips > 0;
+        if (!ntips && !click) {
+            system_swipe_tail = 0;
+            tap_active = tap_nfid = type_grandf = 0;
+        }
+        return;
+    }
+    DragContact drag_contacts[NFINGER];
+    int drag_count = 0;
+    for (int i = 0; i < NFINGER; i++) if (tips[i])
+        drag_contacts[drag_count++] = (DragContact){contact_id[i], fx[i], fy[i]};
+    if (handle_three_drag(drag_contacts, drag_count, r[26] | (r[27] << 8), swallow, click))
+        return;
+    if (drag3_on && ntips >= 4 && !swipe3_on && !btn_prev) {
+        // Disabling desktop swipes does not turn four fingers into scrolling,
+        // nor may their staggered lift start a three-finger drag.
+        if (scroll_active) {
+            scrl_ema_x = scrl_ema_y = 0;
+            end_scroll_gesture();
+            scroll_active = 0;
+        }
+        system_swipe_tail = 1;
+        have_last = 0;
+        tap_moved = tap_pointer_moved = 1;
+        touch_now = swallow ? 0 : 1;
+        return;
+    }
     if (ntips != 1) pinch_tail = 0;
     if (pinch_tail && !click && !btn_prev && !swallow) {
         have_last = 0; touch_now = 1; tap_moved = 1;
@@ -1495,15 +1606,12 @@ static void handle_report(uint32_t cb_rid, uint8_t *r, CFIndex len) {
 
     CGPoint cur = cursor_pos();
 
-    // 三指手势收尾(抬指/降为双指): 三指在板期间不发移动/滚动
-    if (swipe3_active && (ntips < 3 || !swipe3_on)) swipe3_end();
-
-    if (ntips >= 3 && swipe3_on && !swallow && !btn_prev && !click) {
-        // ---- 三指: 左右滑切换全屏应用/桌面空间 (dock swipe) ----
+    if (ntips >= swipe_fingers && swipe3_on && !swallow && !btn_prev && !click) {
+        // ---- 四指(兼容模式为三指): 切空间/调度中心 (dock swipe) ----
         // 物理按住期间不进此分支: 按住时一切触摸都是拖移(同原生触控板)。
-        // 质心 = 最早按下的最多三个指尖
+        // 质心 = 最早按下的四指(或兼容模式下的三指)
         int pick[NFINGER], npick = 0, c3x = 0, c3y = 0;
-        for (int rank = 0; rank < 3; rank++) {
+        for (int rank = 0; rank < swipe_fingers; rank++) {
             int best = -1, best_seq = 0x7fffffff;
             for (int i = 0; i < NFINGER; i++) {
                 if (!tips[i] || down_seq[i] <= 0) continue;
@@ -1528,6 +1636,7 @@ static void handle_report(uint32_t cb_rid, uint8_t *r, CFIndex len) {
             }
         }
         have_last = 0;
+        touch_now = 1;
     } else if (ntips == 0 && !swallow) {
         // 双指抬起瞬间: 发 Ended 收尾; 甩动够快则接惯性滚动物理曲线
         // (先记住本轮是否真滚过 — end_scroll_gesture 会复位 gesture_state)
@@ -1747,8 +1856,9 @@ static void handle_report(uint32_t cb_rid, uint8_t *r, CFIndex len) {
     }
 
     // ---- 物理按压: 单指=左键, 双指及以上=右键 ----
-    // 三指在板期间不响应按压(同原生触控板: 三指按住不是点击)
-    if (ntips >= 3 && swipe3_on) return;
+    // Desktop gestures cannot start a button press, but an existing physical
+    // button must still reach the release path even with extra fingers down.
+    if (ntips >= swipe_fingers && swipe3_on && !btn_prev) return;
     // 按下立即响应; 松开经 5 帧(≈50ms)消抖, 吞掉机械回弹造成的 1-0-1 抖动
     // (实测出现过 40ms 回弹间隙, 会被系统误判为双击)。
     // 连击计数: 500ms 内且位移 <12px 的再次按下 → count 递增(双击=2, 三击=3),
@@ -1793,6 +1903,7 @@ static void handle_report(uint32_t cb_rid, uint8_t *r, CFIndex len) {
             btn_prev = 0;
             release_streak = 0;
             drag_armed = 0;   // 本轮按压结束, 抑制期随之结束
+            if (drag3_on && ntips >= 3) three_drag.phase = DRAG3_TAIL;
         }
     }
 
@@ -1922,6 +2033,9 @@ static void device_attached(void *context, IOReturn result,
 static void device_detached(void *context, IOReturn result,
                             void *sender, IOHIDDeviceRef device) {
     (void)context; (void)result; (void)sender; (void)device;
+    release_pointer_buttons();
+    swipe3_end(1);
+    system_swipe_tail = 0;
     pinch_finish(1);
     if (scroll_active) {
         scrl_ema_x = scrl_ema_y = 0;
@@ -1952,6 +2066,7 @@ int main(int argc, char **argv) {
         if (isfinite(value) && value >= 0.1 && value <= 4) pinch_gain = value;
     }
     if ((env = getenv("TPKB_SWIPE3"))        != NULL) swipe3_on   = atoi(env);
+    if ((env = getenv("TPKB_DRAG3"))         != NULL) drag3_on    = atoi(env) != 0;
     if ((env = getenv("TPKB_SWIPE3_GAIN"))   != NULL) swipe3_gain = atof(env);
     if ((env = getenv("TPKB_TAPCLICK"))      != NULL) tap_on      = atoi(env);
     if ((env = getenv("TPKB_TAP_RIGHT"))     != NULL) tap_right_on = atoi(env);
@@ -1984,6 +2099,8 @@ int main(int argc, char **argv) {
 
     signal(SIGUSR1, scroll_trace_signal);
     signal(SIGUSR2, scroll_trace_signal);
+    signal(SIGTERM, driver_stop_signal);
+    signal(SIGINT, driver_stop_signal);
     CFRunLoopTimerRef trace_timer = CFRunLoopTimerCreate(NULL, CFAbsoluteTimeGetCurrent(),
                                                         0.25, 0, 0, scroll_trace_control, NULL);
     if (trace_timer) {
@@ -2000,6 +2117,8 @@ int main(int argc, char **argv) {
             pointer_motion_gain(1500, move_gain, move_acceleration));
     fprintf(stderr, "[tpkbd] 双指捏合=%s gain=%.2f, 与滚动分流, 按压优先拖移\n",
             pinch_on ? "开" : "关", pinch_gain);
+    fprintf(stderr, "[tpkbd] 三指拖移=%s, 桌面手势=%s (%d指)\n",
+            drag3_on ? "开" : "关", swipe3_on ? "开" : "关", drag3_on ? 4 : 3);
     scroll_frames_init();
     hid_api_init();
     update_display_bounds();
@@ -2091,5 +2210,9 @@ int main(int argc, char **argv) {
     }
 
     CFRunLoopRun();
+    release_pointer_buttons();
+    pinch_finish(1);
+    swipe3_end(1);
+    swipe3_resend_cancel();
     return 0;
 }

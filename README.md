@@ -8,7 +8,7 @@
 
 The ThinkPad X1 Tablet Thin Keyboard Gen 3 (Chicony, USB VID `17ef` PID `60b5`) is a popular donor keyboard for DIY mechanical/compact keyboard builds. Plug it into a Mac and two of its three input devices work out of the box: the keyboard and the TrackPoint. The **touchpad is completely dead** — the firmware ships it in a PC-style relative-mouse mode that macOS simply has no driver for.
 
-It turns out the touchpad also implements the **standard HID multitouch digitizer protocol**; it just needs to be switched into that mode. No kernel extension, no DriverKit, no reverse-engineered proprietary protocol required — everything below is a single-file C userspace daemon (~1300 lines) shipped as a LaunchAgent.
+It turns out the touchpad also implements the **standard HID multitouch digitizer protocol**; it just needs to be switched into that mode. No kernel extension or DriverKit required — the driver is a small C userspace daemon shipped as a LaunchAgent.
 
 ## Features
 
@@ -22,8 +22,9 @@ It turns out the touchpad also implements the **standard HID multitouch digitize
 | 2-finger flick | Momentum scrolling | Physics curve ported from Mac Mouse Fix's trackpad-like defaults |
 | 2-finger pinch / spread | Zoom out / in | Native magnify events in supporting apps; lift and touch again to switch between scrolling and zooming |
 | 2-finger press | Right click | 2-finger *tap*-right-click is off by default (easy to trigger accidentally) — enable with `TPKB_TAP_RIGHT=1` |
-| 3-finger swipe left/right | Switch desktop space / full-screen app | Follows the finger, pull back to cancel |
-| 3-finger swipe up / down | Mission Control / App Exposé | |
+| 3-finger move | Drag / text selection | No press needed; starts at the cursor, releases when fewer than 3 fingers remain; remaining contacts cannot scroll or move the cursor |
+| 4-finger swipe left/right | Switch desktop space / full-screen app | Follows the finger, pull back to cancel |
+| 4-finger swipe up / down | Mission Control / App Exposé | Lift all fingers before starting a drag |
 | Any typing | Touchpad locked for 500 ms | libinput-style disable-while-typing; touches already in progress are exempt; held buttons never stick |
 | Win ↔ Alt keys | Remapped to Option / Command | Matches the Mac bottom-row layout, applied via `hidutil` **only to this keyboard** |
 | Hold middle button + TrackPoint | Smooth scrolling | Classic ThinkPad scrolling with momentum; the cursor drifts slightly while active (known limitation, see Troubleshooting); a plain middle click does nothing by default — remap with `TPKB_TP_CLICK` |
@@ -32,7 +33,7 @@ The TrackPoint is deliberately left untouched — macOS already drives it native
 
 ## Requirements
 
-- macOS 26 or newer. Tested on **macOS 27.0.1, Apple Silicon** only. (The 3-finger Mission Control / space-switching events use the macOS 27 IOHIDEvent path; older systems would need the pre-27 variant that Mac Mouse Fix implements.)
+- macOS 26 or newer. Tested on **macOS 27.0.1, Apple Silicon** only. (Mission Control / space-switching events use the macOS 27 IOHIDEvent path; older systems would need the pre-27 variant that Mac Mouse Fix implements.)
 - Xcode Command Line Tools (`xcode-select --install`).
 - The keyboard connected over USB.
 
@@ -81,8 +82,9 @@ Everything is an environment variable in the plist — change and `launchctl boo
 | `TPKB_DRAG_SLOP` | 12 | Click-time drag slop (sensor counts): movement below this right after a press is swallowed so the press reads as a clean click — screenshot window-picking etc. depend on it; 0 disables |
 | `TPKB_MOVE_SLOP` | 14 | Landing dead zone (sensor counts), ≈ libinput's 1.3 mm tap-move threshold: landing-settle shifts don't move the cursor and don't cancel taps; crossing it releases tracking with the full distance replayed |
 | `TPKB_TAP_MS` | 250 | Max tap duration (ms) |
-| `TPKB_SWIPE3` | 1 | 3-finger gestures |
-| `TPKB_SWIPE3_GAIN` | 1.0 | 3-finger swipe speed |
+| `TPKB_DRAG3` | 1 | Three-finger drag / selection; 0 restores the original three-finger desktop swipes |
+| `TPKB_SWIPE3` | 1 | Desktop swipes (legacy name); uses four fingers when three-finger dragging is enabled |
+| `TPKB_SWIPE3_GAIN` | 1.0 | Desktop swipe speed (three or four fingers) |
 | `TPKB_TYPELOCK_MS` | 500 | Typing lockout window, 0 = off |
 | `TPKB_SWAP_WINALT` | 1 | Win↔Alt remap to Option/Command |
 | `TPKB_TP_SCROLL` | 1 | TrackPoint middle-button scrolling on/off |
@@ -96,7 +98,7 @@ Everything is an environment variable in the plist — change and `launchctl boo
 1. **Mode switch.** On attach, the daemon sends the standard HID *Input Mode* feature report (report ID 4, value 3) to the mouse interface. The firmware then emits multitouch digitizer reports (ID `0x03`) instead of relative-mouse ones. The setting sticks across replugs. Gotcha: the feature buffer must be `[reportID, value]` — sending the payload alone returns success but changes nothing.
 2. **Report parsing.** 30-byte reports: 5 finger slots × 5 bytes (confidence/tip/contact-id flags, 16-bit X∈[0,1163], Y∈[0,718]), scan time, contact count, and a physical button bit. Details and the decoding methodology are in the source comments and [docs/devlog.md](docs/devlog.md).
 3. **Event synthesis.** The interesting part. Posting plain scroll events makes every app apply its own mouse-wheel acceleration — that's why third-party touchpad tools feel janky. Native trackpad feel comes from **gesture-phase event streams**: `MayBegin → Began → Changed → Ended` scroll events marked continuous, each followed by a type-29 gesture event (Safari swipe-back depends on it), then a momentum-phase stream after lift. The momentum physics (drag curve `v' = −a·v^b`, a=30, b=0.7), the phase semantics, and the entire approach are **ported from [Mac Mouse Fix](https://github.com/noah-nuebling/mac-mouse-fix)**.
-4. **System gestures.** 3-finger swipes construct private `IOHIDEvent`s (type 23, DockSwipe) with motion/flavor/progress fields, a velocity child event, and a CGEvent type-30 carrier — same construction MMF uses on macOS 27. Space-switching scale adapts to the number of spaces via the private CGS API; end events get resent (200/500 ms) to dodge a system bug where the gesture can get stuck.
+4. **Dragging and system gestures.** Three-finger dragging emits left-button Down/Dragged/Up, reusing the pointer speed curve and preserving fractional centroid travel. Stationary touches do not click; contact slot/ID changes reanchor. Four-finger swipes construct private `IOHIDEvent`s (type 23, DockSwipe) with motion/flavor/progress fields, a velocity child event, and a CGEvent type-30 carrier — same construction MMF uses on macOS 27. Space-switching scale adapts to the number of spaces via the private CGS API; end events get resent (200/500 ms) to dodge a system bug where the gesture can get stuck. Established gestures retain ownership until lift so dragging and desktop swipes cannot steal each other's contacts.
 5. **Everything else:** cursor clamping uses the union rectangle of all displays (a single-display clamp traps the cursor); typing lock is a listen-only keyDown tap implementing libinput's disable-while-typing semantics; the Win↔Alt remap shells out to `hidutil` with a VID/PID match so only this keyboard is affected.
 
 See [docs/devlog.md](docs/devlog.md) for the full reverse-engineering story, including the report-layout pitfall that cost two debugging sessions.
@@ -113,7 +115,8 @@ See [docs/devlog.md](docs/devlog.md) for the full reverse-engineering story, inc
 
 ## Limitations
 
-- No three-finger-drag, no force click (hardware has no pressure sensor).
+- Three-finger dragging releases when fewer than three contacts remain; no drag lock or lift-and-reposition grace is implemented. Lift all fingers before starting the next gesture.
+- No force click (hardware has no pressure sensor).
 - Typing lock does not apply inside Secure Input sessions (password fields) — the system hides key events from event taps there.
 - Tested on exactly one keyboard firmware and one macOS version. Report IDs and the report layout are verified constants for this device; a different firmware may differ.
 
