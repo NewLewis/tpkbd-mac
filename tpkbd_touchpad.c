@@ -26,7 +26,7 @@
 //
 // 编译:
 //   clang -O2 -framework CoreFoundation -framework IOKit \
-//         -framework CoreGraphics -framework ApplicationServices \
+//         -framework CoreGraphics -framework ApplicationServices -framework CoreVideo \
 //         -o tpkbd_touchpad tpkbd_touchpad.c
 //
 // 运行:
@@ -52,6 +52,10 @@
 #include <sys/wait.h>
 #include <mach/mach_time.h>
 #include <dlfcn.h>
+#include <signal.h>
+#include <stdatomic.h>
+#include <CoreVideo/CoreVideo.h>
+#include "scroll_resampler.h"
 
 #define VID               0x17ef
 #define PID               0x60b5
@@ -85,7 +89,8 @@ static int last_px = 0, last_py = 0;    // 跟踪指上次 pad 坐标
 static int last_sx = 0, last_sy = 0;    // 跟踪指上次对应的光标屏幕坐标
 static int move_slot = -1;              // 当前跟随的指槽; 换跟指时重新锚定不跳变
 static int scroll_active = 0;
-static int last_cx = 0, last_cy = 0;    // 两指质心上次 pad 坐标
+static uint64_t scroll_lift_ms = 0; // 双指通常先后抬起, 短暂单指不应截断惯性
+static double last_cx = 0, last_cy = 0; // 保留双指质心的半个 count, 慢滚不交替丢帧
 static int btn_prev = 0;
 static int rel_btn_prev = 0;            // 相对模式左键上一状态
 // ---- 点击状态机 ----
@@ -94,8 +99,10 @@ static uint64_t last_down_ms = 0;       // 上次按下时间
 static double last_down_x = 0, last_down_y = 0;
 static int release_streak = 0;          // 松开消抖: button=0 连续帧数
 
+static uint64_t mach_ns(void);
+
 static uint64_t now_ms(void) {
-    return (uint64_t)(CFAbsoluteTimeGetCurrent() * 1000.0);
+    return mach_ns() / 1000000;
 }
 
 // ---- --capture 模式: 抓取系统滚动事件(逆向 macOS 触控板动量手感) ----
@@ -280,6 +287,7 @@ static int      tap_right_on = 0;      // TPKB_TAP_RIGHT: 双指轻点=右键(�
 static int      tap_ms_thresh = 250;   // TPKB_TAP_MS
 static int      tap_nfid = 0;          // 本轮触摸的峰值指数
 static int      tap_moved = 0;         // 主指位移超阈值
+static int      tap_pointer_moved = 0; // 本轮已经移动过光标, 不能再被重新判成轻点
 static int      tap_active = 0;        // 本轮触摸已记录
 static uint64_t tap_down_ms = 0;
 static int      tap_anchor_x = 0, tap_anchor_y = 0;
@@ -294,6 +302,11 @@ static int      move_slop = 14;        // TPKB_MOVE_SLOP(counts): 落指死区, 
 static int      mv_slop_done = 0;      // 本轮接触已越过落指死区
 static int      mv_frames = 0;         // 本轮接触已跟踪帧数
 static int      snap_done = 0;         // 本轮接触已吞掉落板跳变(仅一次)
+
+// 轻点与落指死区共用闭区间, 避免同一帧既允许点击又放行移动。
+static int outside_move_slop(int dx, int dy) {
+    return abs(dx) > move_slop || abs(dy) > move_slop;
+}
 
 // ---- 打字锁定 (disable-while-typing, libinput DWT 语义) ----
 // 敲键后 typelock_ms 内吞掉触摸板的"新"触摸(移动/滚动/手势/轻点/新按压);
@@ -364,6 +377,53 @@ static uint64_t mach_ns(void) {
     return mach_absolute_time() * tb.numer / tb.denom;
 }
 
+// SIGUSR1: 30 秒有界采样。信号处理只置位, 热路径只写内存, 结束才输出日志。
+// R=设备触摸报文(ntips,触点槽位掩码,质心x*2,y*2,scanTime,按压),
+// S=发出的滚动事件(phase,momentum,dx,dy)。不监听键盘或其他设备。
+typedef struct {
+    uint64_t ns;
+    char kind;
+    int a, b, c, d, e, f;
+} ScrollTraceRow;
+static ScrollTraceRow scroll_trace_rows[16384];
+static size_t scroll_trace_count = 0;
+static uint64_t scroll_trace_start = 0;
+static volatile sig_atomic_t scroll_trace_requested = 0;
+
+static void scroll_trace_signal(int signo) {
+    (void)signo;
+    scroll_trace_requested = 1;
+}
+
+static void scroll_trace_record(char kind, int a, int b, int c, int d, int e, int f) {
+    if (!scroll_trace_start || scroll_trace_count >= 16384) return;
+    scroll_trace_rows[scroll_trace_count++] = (ScrollTraceRow){mach_ns(), kind, a, b, c, d, e, f};
+}
+
+static void scroll_trace_control(CFRunLoopTimerRef timer, void *context) {
+    (void)timer; (void)context;
+    if (scroll_trace_requested) {
+        scroll_trace_requested = 0;
+        if (!scroll_trace_start) {
+            scroll_trace_count = 0;
+            scroll_trace_start = mach_ns();
+            fprintf(stderr, "[scroll-trace] START: recording touch/scroll timing for 30 seconds\n");
+        }
+    }
+    if (!scroll_trace_start || mach_ns() - scroll_trace_start < 30000000000ULL) return;
+    uint64_t start = scroll_trace_start;
+    scroll_trace_start = 0;
+    fprintf(stderr, "[scroll-trace] DATA: us,kind,a,b,c,d,e,f\n");
+    for (size_t i = 0; i < scroll_trace_count; i++) {
+        ScrollTraceRow *r = &scroll_trace_rows[i];
+        fprintf(stderr, "[scroll-trace] %llu,%c,%d,%d,%d,%d,%d,%d\n",
+                (unsigned long long)((r->ns - start) / 1000), r->kind,
+                r->a, r->b, r->c, r->d, r->e, r->f);
+    }
+    fprintf(stderr, "[scroll-trace] END: %zu rows%s\n", scroll_trace_count,
+            scroll_trace_count == 16384 ? " (buffer full)" : "");
+}
+
 // 发一个 type22 滚动事件(+手势期附带 type29)。px 增量必须已取整。
 static void send_scroll_event(int32_t ipx, int32_t ipy,
                               double gdx, double gdy,
@@ -382,11 +442,13 @@ static void send_scroll_event(int32_t ipx, int32_t ipy,
     CGEventSetIntegerValueField(e, 12, lx);    // DeltaAxis2      行增量(横)
     CGEventSetIntegerValueField(e, 96, ipy);   // PointDeltaAxis1 像素增量(竖)
     CGEventSetIntegerValueField(e, 97, ipx);   // PointDeltaAxis2 像素增量(横)
-    CGEventSetIntegerValueField(e, 93, ly * 65536);  // FixedPt 16.16(竖)
-    CGEventSetIntegerValueField(e, 94, lx * 65536);  // FixedPt 16.16(横)
+    // FixedPt 有小数精度, 不能从已截断的整行增量生成, 否则慢滚是 0/1 行跳变。
+    CGEventSetDoubleValueField(e, kCGScrollWheelEventFixedPtDeltaAxis1, ipy * 0.1);
+    CGEventSetDoubleValueField(e, kCGScrollWheelEventFixedPtDeltaAxis2, ipx * 0.1);
     CGEventSetIntegerValueField(e, 99, phase);
     CGEventSetIntegerValueField(e, 123, mom_phase);
     CGEventSetTimestamp(e, mach_ns());
+    scroll_trace_record('S', phase, mom_phase, ipx, ipy, 0, 0);
     CGEventPost(g_tap, e);
     CFRelease(e);
 
@@ -404,8 +466,11 @@ static void send_scroll_event(int32_t ipx, int32_t ipy,
     }
 }
 
+static void scroll_velocity_reset(void);
+
 // 双指手势开始: 发 MayBegin(零增量), 重置累积器
 static void gesture_send_maybegin(void) {
+    scroll_velocity_reset();
     scroll_acc_x = scroll_acc_y = 0;
     line_acc_x = line_acc_y = 0;
     gesture_state = 1;
@@ -426,14 +491,70 @@ static void post_gesture_scroll(double dx, double dy) {
     send_scroll_event(ipx, ipy, ipx * 1.67, ipy * 1.67, phase, MPH_NONE, 1);
 }
 
+// 触摸位移按显示刷新重采样。12ms 缓冲覆盖实测 7.1ms 扫描周期及 USB 到达抖动。
+// 只在已经收到的位置间插值, 不预测未来位移, 因此停手不会继续漂移。
+static double scroll_smooth_ms = 12.0; // TPKB_SCROLL_SMOOTH_MS=0 可对照直通模式
+static ScrollResampler touch_resampler;
+static int touch_resampling = 0;
+static uint16_t touch_scan_previous = 0;
+static uint64_t touch_sample_ns = 0;
+static int scroll_scheduler_enabled = 0;
+static void scroll_frames_start(void);
+static void scroll_frames_stop_if_idle(void);
+
+static void touch_scroll_begin(uint64_t ns, uint16_t scan) {
+    touch_sample_ns = ns;
+    touch_scan_previous = scan;
+    touch_resampling = scroll_smooth_ms > 0;
+    if (touch_resampling) {
+        scroll_resampler_begin(&touch_resampler, ns);
+        scroll_frames_start();
+    }
+}
+
+static uint64_t touch_scroll_time(uint64_t received_ns, uint16_t scan) {
+    // HID Scan Time 以 100us 为单位, 实测每帧递增 71/72; 用它排除 USB 调度抖动。
+    uint16_t ticks = (uint16_t)(scan - touch_scan_previous);
+    uint64_t next = touch_sample_ns + (uint64_t)ticks * 100000;
+    uint64_t error = next > received_ns ? next - received_ns : received_ns - next;
+    if (!ticks || ticks > 1000 || error > 20000000) next = received_ns;
+    if (next <= touch_sample_ns) next = touch_sample_ns + 1;
+    touch_scan_previous = scan;
+    touch_sample_ns = next;
+    return next;
+}
+
+static void touch_scroll_push(double dx, double dy, uint64_t ns) {
+    if (touch_resampling) scroll_resampler_push(&touch_resampler, ns, dx, dy);
+    else post_gesture_scroll(dx, dy);
+}
+
+static void touch_scroll_tick(uint64_t ns) {
+    if (!touch_resampling) return;
+    uint64_t delay = (uint64_t)(scroll_smooth_ms * 1e6);
+    double dx, dy;
+    scroll_resampler_read(&touch_resampler, ns > delay ? ns - delay : 0, &dx, &dy);
+    post_gesture_scroll(dx, dy);
+}
+
+static void touch_scroll_finish(void) {
+    if (!touch_resampling) return;
+    double dx, dy;
+    // 先送完最多一个缓冲窗口的剩余位移, 再发 Ended; 不遗留到下次手势。
+    scroll_resampler_read(&touch_resampler, UINT64_MAX, &dx, &dy);
+    post_gesture_scroll(dx, dy);
+    touch_resampling = 0;
+}
+
 // 惯性滚动帧: 只发 type22, field99=Undefined + 动量相位
-static void post_momentum_scroll(double dx, double dy, int mom_phase) {
+static int post_momentum_scroll(double dx, double dy, int mom_phase) {
     if (mom_phase == MPH_BEGIN) { line_acc_x = line_acc_y = 0; }  // 同 MMF: 动量期重置行累积
     scroll_acc_x += dx; scroll_acc_y += dy;
     int32_t ipx = (int32_t)scroll_acc_x, ipy = (int32_t)scroll_acc_y;
     scroll_acc_x -= ipx; scroll_acc_y -= ipy;
-    if (!ipx && !ipy && mom_phase != MPH_END) return;  // End 零增量也必须发(收尾信号)
+    if (!ipx && !ipy && mom_phase != MPH_END) return 0;  // End 零增量也必须发(收尾信号)
     send_scroll_event(ipx, ipy, 0, 0, PH_UNDEFINED, mom_phase, 0);
+    return 1;
 }
 
 // ---- 惯性滚动(松手渐停) ----
@@ -454,31 +575,49 @@ static double mom_Q = 0, mom_p = 0;            // 曲线常数
 static double mom_u0p = 0;                     // v0^(2-b), 预计算
 static double mom_c = 0, mom_ustop = 0, mom_total_d = 0;
 static double mom_last_d = 0;                  // 已下发距离
-static uint64_t mom_start_ms = 0;
+static uint64_t mom_start_ns = 0;
 static int mom_begun = 0;                         // 已发出动量Begin事件
 static double scrl_ema_x = 0, scrl_ema_y = 0;  // 松手速度EMA, 单位 px/ms(屏上方向)
-static uint64_t last_scrl_ms = 0;              // 上次双指帧时间(判"停顿后松手")
-static CFRunLoopTimerRef mom_timer = NULL;
+static double last_scrl_ms = 0;                // 单调时钟, 保留亚毫秒精度
+
+// 固定时间常数, 而非固定帧权重: 10ms 一帧时约等于旧的 0.3 权重。
+// 同样的动作在不同报文频率下应得到相同的松手速度。
+static const double scroll_velocity_tau_ms = 28.0;
+
+static void scroll_velocity_reset(void) {
+    scrl_ema_x = scrl_ema_y = 0;
+    last_scrl_ms = (double)mach_ns() / 1e6;
+}
+
+static void scroll_velocity_update(double dx, double dy, double timestamp_ms) {
+    double dt = timestamp_ms - last_scrl_ms;
+    if (dt <= 0) return;
+    if (dt > 150.0) scrl_ema_x = scrl_ema_y = 0;
+    double alpha = -expm1(-dt / scroll_velocity_tau_ms);
+    // 反向时丢掉上一方向的速度, 防止短促回拉后仍向原方向惯性滑行。
+    if (dx * scrl_ema_x < 0) scrl_ema_x = 0;
+    if (dy * scrl_ema_y < 0) scrl_ema_y = 0;
+    scrl_ema_x += alpha * (dx / dt - scrl_ema_x);
+    scrl_ema_y += alpha * (dy / dt - scrl_ema_y);
+    last_scrl_ms = timestamp_ms;
+}
 
 static void mom_stop(void) {
     if (!mom_active) return;
     mom_active = 0;
-    if (mom_timer) {
-        CFRunLoopRemoveTimer(CFRunLoopGetMain(), mom_timer, kCFRunLoopDefaultMode);
-        CFRelease(mom_timer); mom_timer = NULL;
-    }
     // 截停(手指重新接触/物理按压)也要发动量End, App 才知道滑行结束
     if (mom_begun) post_momentum_scroll(0, 0, MPH_END);
     else send_scroll_event(0, 0, 0, 0, PH_UNDEFINED, MPH_END, 0);
     mom_begun = 0;
     scrl_ema_x = scrl_ema_y = 0;
     last_scrl_ms = 0;
+    scroll_frames_stop_if_idle();
 }
 
 static void mom_timer_cb(CFRunLoopTimerRef t, void *info) {
     (void)t; (void)info;
     if (!mom_active) return;
-    double ts = (double)(now_ms() - mom_start_ms) / 1000.0;
+    double ts = (double)(mach_ns() - mom_start_ns) / 1e9;
     double u = mom_Q * (mom_c - ts);
     double d;
     int done = 0;
@@ -487,9 +626,10 @@ static void mom_timer_cb(CFRunLoopTimerRef t, void *info) {
     double delta = d - mom_last_d;
     mom_last_d = d;
     if (delta != 0) {
-        post_momentum_scroll(mom_dir_x * delta, mom_dir_y * delta,
-                             mom_begun ? MPH_CONTINUE : MPH_BEGIN);
-        mom_begun = 1;
+        // 首帧不足一像素时会被累积, 必须等真正发出 Begin 才能转 Continue。
+        if (post_momentum_scroll(mom_dir_x * delta, mom_dir_y * delta,
+                                 mom_begun ? MPH_CONTINUE : MPH_BEGIN))
+            mom_begun = 1;
     }
     if (done) mom_stop();
 }
@@ -505,27 +645,27 @@ static void mom_start(double dirx, double diry, double v0) {
     mom_total_d = (mom_u0p - 1.0) / (mom_Q * mom_p); // vs^(2-b)=1
     mom_dir_x = dirx; mom_dir_y = diry;
     mom_last_d = 0;
-    mom_start_ms = now_ms();
+    mom_start_ns = mach_ns();
     mom_begun = 0;
     mom_active = 1;
-    CFRunLoopTimerContext ctx = {0};
-    mom_timer = CFRunLoopTimerCreate(kCFAllocatorDefault,
-                                     CFAbsoluteTimeGetCurrent() + 0.01, 0.01,
-                                     0, 0, mom_timer_cb, &ctx);
-    if (mom_timer) CFRunLoopAddTimer(CFRunLoopGetMain(), mom_timer, kCFRunLoopDefaultMode);
-    else mom_active = 0;
+    scroll_frames_start();
 }
 
 // 滚动手势收尾(抬指或双指变单指): 发 Ended(从未滚动则 Cancelled),
 // 够快则接惯性滚动, 否则补零增量 momentumEnd 阻断 Xcode 等的自带惯性
 // (MMF 实测: 仅发 Ended 时部分 App 会基于最后一个 Changed 自行续滚)。
 static void end_scroll_gesture(void) {
+    touch_scroll_finish();
     int start_mom = 0;
     double sp = 0;
-    if (momentum_on) {
-        sp = hypot(scrl_ema_x, scrl_ema_y) * 1000.0;   // px/s
-        if (sp > 60.0 && last_scrl_ms &&
-            now_ms() - last_scrl_ms < 150) start_mom = 1;
+    if (momentum_on && gesture_state >= 2 && last_scrl_ms) {
+        // 有些固件静止后不继续发报文: 松手前的空档也必须让速度衰减。
+        // 留出 20ms 给正常的抬指报文传输, 更长的停顿按同一时间常数衰减。
+        double age = fmax(0.0, (double)mach_ns() / 1e6 - last_scrl_ms);
+        double decay = exp(-fmax(0.0, age - 20.0) / scroll_velocity_tau_ms);
+        scrl_ema_x *= decay; scrl_ema_y *= decay;
+        sp = hypot(scrl_ema_x, scrl_ema_y) * 1000.0;
+        if (sp > 60.0 && age < 150.0) start_mom = 1;
     }
     if (gesture_state >= 2) {
         send_scroll_event(0, 0, 0, 0, PH_ENDED, MPH_NONE, 1);
@@ -535,6 +675,7 @@ static void end_scroll_gesture(void) {
         gesture_state = 0;
         scrl_ema_x = scrl_ema_y = 0;
         last_scrl_ms = 0;
+        scroll_frames_stop_if_idle();
         return;
     }
     gesture_state = 0;
@@ -551,7 +692,110 @@ static void end_scroll_gesture(void) {
         scrl_ema_x = scrl_ema_y = 0;
         last_scrl_ms = 0;
     }
+    scroll_frames_stop_if_idle();
 }
+
+// C 后台程序使用 CoreVideo 显示时钟; 回调线程只通知主循环, 不碰手势状态。
+// 当前 SDK 推荐的替代接口依赖 NSView/NSWindow, 本程序没有 AppKit 窗口。
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+static CVDisplayLinkRef scroll_display_link = NULL;
+static CFRunLoopSourceRef scroll_frame_source = NULL;
+static CFRunLoopTimerRef scroll_frame_fallback = NULL;
+static _Atomic uint64_t scroll_display_last_ns = 0;
+static int scroll_frames_running = 0;
+
+static void scroll_frame_perform(void *context) {
+    (void)context;
+    if (!scroll_frames_running) return;
+    touch_scroll_tick(mach_ns());
+    if (mom_active) mom_timer_cb(NULL, NULL);
+    scroll_frames_stop_if_idle();
+}
+
+static CVReturn scroll_display_callback(CVDisplayLinkRef link, const CVTimeStamp *now,
+                                       const CVTimeStamp *output, CVOptionFlags in,
+                                       CVOptionFlags *out, void *context) {
+    (void)link; (void)now; (void)output; (void)in; (void)out; (void)context;
+    atomic_store_explicit(&scroll_display_last_ns, mach_ns(), memory_order_relaxed);
+    CFRunLoopSourceSignal(scroll_frame_source);
+    CFRunLoopWakeUp(CFRunLoopGetMain());
+    return kCVReturnSuccess;
+}
+
+static void scroll_frame_fallback_cb(CFRunLoopTimerRef timer, void *context) {
+    (void)timer; (void)context;
+    uint64_t last = atomic_load_explicit(&scroll_display_last_ns, memory_order_relaxed);
+    // 显示时钟不可用/热拔屏时仍能滚动, 恢复后自动回到刷新同步。
+    if (!last || mach_ns() - last > 50000000) scroll_frame_perform(NULL);
+}
+
+static void scroll_frames_init(void) {
+    CFRunLoopSourceContext context = {0};
+    context.perform = scroll_frame_perform;
+    scroll_frame_source = CFRunLoopSourceCreate(NULL, 0, &context);
+    if (scroll_frame_source) {
+        CFRunLoopAddSource(CFRunLoopGetMain(), scroll_frame_source, kCFRunLoopDefaultMode);
+        if (CVDisplayLinkCreateWithActiveCGDisplays(&scroll_display_link) == kCVReturnSuccess) {
+            if (CVDisplayLinkSetOutputCallback(scroll_display_link, scroll_display_callback, NULL)
+                != kCVReturnSuccess) {
+                CVDisplayLinkRelease(scroll_display_link);
+                scroll_display_link = NULL;
+            }
+        }
+    }
+    scroll_scheduler_enabled = 1;
+    fprintf(stderr, "[tpkbd] 滚动重采样: %.1fms, 显示时钟=%s (不可用时120Hz回退)\n",
+            scroll_smooth_ms, scroll_display_link ? "就绪" : "不可用");
+}
+
+static void scroll_frames_start(void) {
+    if (!scroll_scheduler_enabled || scroll_frames_running) return;
+    scroll_frames_running = 1;
+    atomic_store_explicit(&scroll_display_last_ns, 0, memory_order_relaxed);
+    if (scroll_display_link) {
+        CGEventRef event = CGEventCreate(NULL);
+        CGDirectDisplayID display = CGMainDisplayID();
+        uint32_t count = 0;
+        if (event) {
+            CGGetDisplaysWithPoint(CGEventGetLocation(event), 1, &display, &count);
+            CFRelease(event);
+        }
+        if (!count) display = CGMainDisplayID();
+        CVDisplayLinkSetCurrentCGDisplay(scroll_display_link, display);
+        CVReturn result = CVDisplayLinkStart(scroll_display_link);
+        static CGDirectDisplayID last_display = 0;
+        if (debug || display != last_display || result != kCVReturnSuccess) {
+            CVTime period = CVDisplayLinkGetNominalOutputVideoRefreshPeriod(scroll_display_link);
+            double hz = period.timeValue > 0 ? (double)period.timeScale / period.timeValue : 0;
+            fprintf(stderr, "[tpkbd] 滚动显示时钟 display=%u nominal=%.1fHz start=%d\n",
+                    display, hz, result);
+            last_display = display;
+        }
+    }
+    scroll_frame_fallback = CFRunLoopTimerCreate(NULL, CFAbsoluteTimeGetCurrent() + 1.0/120,
+                                                1.0/120, 0, 0, scroll_frame_fallback_cb, NULL);
+    if (scroll_frame_fallback)
+        CFRunLoopAddTimer(CFRunLoopGetMain(), scroll_frame_fallback, kCFRunLoopDefaultMode);
+    else if (!scroll_display_link || !CVDisplayLinkIsRunning(scroll_display_link)) {
+        // 两种时钟都失败时恢复直通, 避免无输出。
+        touch_scroll_finish();
+        mom_active = 0;
+        scroll_frames_stop_if_idle();
+    }
+}
+
+static void scroll_frames_stop_if_idle(void) {
+    if (!scroll_frames_running || touch_resampling || mom_active) return;
+    scroll_frames_running = 0;
+    if (scroll_display_link) CVDisplayLinkStop(scroll_display_link);
+    if (scroll_frame_fallback) {
+        CFRunLoopTimerInvalidate(scroll_frame_fallback);
+        CFRelease(scroll_frame_fallback);
+        scroll_frame_fallback = NULL;
+    }
+}
+#pragma clang diagnostic pop
 
 // ---- 小红点中键: 按住+拨动=丝滑滚动, 单击=可配(默认无动作) ----
 // 机制: 会话级过滤型鼠标 tap。中键按下先吞掉、语义待定:
@@ -990,6 +1234,15 @@ static void handle_report(uint32_t cb_rid, uint8_t *r, CFIndex len) {
         if (tip) ntips++;
     }
 
+    if (scroll_trace_start) {
+        int mask = 0, sx = 0, sy = 0;
+        for (int i = 0; i < NFINGER; i++) if (tips[i]) {
+            mask |= 1 << i; sx += fx[i]; sy += fy[i];
+        }
+        scroll_trace_record('R', ntips, mask, ntips ? sx * 2 / ntips : 0,
+                            ntips ? sy * 2 / ntips : 0, r[26] | (r[27] << 8), r[29] & 1);
+    }
+
     int click = r[29] & 1;   // 物理按压(板面下压); r[28] 是接触计数,别读错
 
     // ---- 打字锁定评估: 敲键后 typelock_ms 内吞掉"新"触摸 ----
@@ -1024,17 +1277,35 @@ static void handle_report(uint32_t cb_rid, uint8_t *r, CFIndex len) {
                 tap_active = 1;
                 tap_nfid = 0;
                 tap_moved = 0;
+                tap_pointer_moved = 0;
                 tap_down_ms = now_ms();
                 tap_anchor_x = fx[prim]; tap_anchor_y = fy[prim];
             }
             if (ntips > tap_nfid) tap_nfid = ntips;
-            if (abs(fx[prim] - tap_anchor_x) > move_slop || abs(fy[prim] - tap_anchor_y) > move_slop)
+            if (outside_move_slop(fx[prim] - tap_anchor_x, fy[prim] - tap_anchor_y))
                 tap_moved = 1;
         }
     }
 
     // 惯性滚动中: 任何新接触或物理按压都立即截停(同 macOS 触控板行为)
     if (mom_active && (ntips > 0 || click)) mom_stop();
+
+    // 双指先后抬起会经历 2→1→0。旧逻辑在 2→1 启动惯性, 下一帧仍有
+    // 一指便立即截停。给剩余手指 60ms 抬起窗口, 等全部离板再决定惯性。
+    // 窗口内不把残留手指误当指针移动; 超时则回到单指移动, 不启动惯性。
+    if (scroll_active && ntips == 1 && !swallow && !btn_prev && !click) {
+        if (!scroll_lift_ms) scroll_lift_ms = now_ms();
+        if (now_ms() - scroll_lift_ms < 60) {
+            have_last = 0;
+            touch_now = 1;
+            return;
+        }
+        scrl_ema_x = scrl_ema_y = 0;
+    } else {
+        if (scroll_lift_ms && (now_ms() - scroll_lift_ms >= 60 || click || swallow))
+            scrl_ema_x = scrl_ema_y = 0;
+        scroll_lift_ms = 0;
+    }
 
     if (debug) {
         fprintf(stderr, "[tpkbd] DG ntips=%d click=%d f0=(%d,%d)tip%d f1=(%d,%d)tip%d\n",
@@ -1079,18 +1350,19 @@ static void handle_report(uint32_t cb_rid, uint8_t *r, CFIndex len) {
     } else if (ntips == 0 && !swallow) {
         // 双指抬起瞬间: 发 Ended 收尾; 甩动够快则接惯性滚动物理曲线
         // (先记住本轮是否真滚过 — end_scroll_gesture 会复位 gesture_state)
-        int tap_scrolled = (gesture_state >= 2);
+        int tap_scrolled = (gesture_state >= 2 || (touch_resampling &&
+                            (touch_resampler.x != 0 || touch_resampler.y != 0)));
         if (scroll_active) end_scroll_gesture();
         else { scrl_ema_x = scrl_ema_y = 0; }
         have_last = 0;
         scroll_active = 0;
 
         // ---- 轻点点按判定 (抬指时回溯评估) ----
-        // 条件: 时长<阈值 + 主指位移<10counts + 峰值指数 1~2 + 未产生滚动像素。
+        // 条件: 时长<阈值 + 两轴位移均在 move_slop 内 + 未移动光标/滚动。
         // 双指滚动哪怕只滚了 1px(gesture_state 到过 2), 两指轻点即作废,
         // 否则轻蹭一下就会弹右键菜单。
         if (tap_active && tap_on && btn_prev == 0 &&
-            (tap_nfid == 1 || (tap_nfid == 2 && tap_right_on)) && !tap_moved &&
+            (tap_nfid == 1 || (tap_nfid == 2 && tap_right_on)) && !tap_moved && !tap_pointer_moved &&
             !tap_scrolled &&
             now_ms() - tap_down_ms < (uint64_t)tap_ms_thresh) {
             if (tap_nfid == 1) {
@@ -1123,8 +1395,8 @@ static void handle_report(uint32_t cb_rid, uint8_t *r, CFIndex len) {
             if (k == 0) s1 = best; else s2 = best;
         }
         if (s1 >= 0 && s2 >= 0) {
-            int cx = (fx[s1] + fx[s2]) / 2;
-            int cy = (fy[s1] + fy[s2]) / 2;
+            double cx = (fx[s1] + fx[s2]) * 0.5;
+            double cy = (fy[s1] + fy[s2]) * 0.5;
             // scroll_active 兼作锚定标志: 首帧只记质心, 之后帧间差分发滚动。
             // (曾有 bug: 差分门控用 have_last, 而本分支每帧末尾清零它, 导致永远不发滚动)
             if (scroll_active) {
@@ -1134,18 +1406,15 @@ static void handle_report(uint32_t cb_rid, uint8_t *r, CFIndex len) {
                 // 自然衰减到 0, "停顿后松手"不会误触发惯性。
                 double sdx = natural ? dx : -dx;
                 double sdy = natural ? dy : -dy;
-                uint64_t nms = now_ms();
-                double dtms = last_scrl_ms ? (double)(nms - last_scrl_ms) : 10.0;
-                if (dtms <= 0) dtms = 10.0;
-                scrl_ema_x = scrl_ema_x * 0.7 + (sdx / dtms) * 0.3;
-                scrl_ema_y = scrl_ema_y * 0.7 + (sdy / dtms) * 0.3;
-                last_scrl_ms = nms;
-                post_gesture_scroll(dx, dy);
-                if (debug) fprintf(stderr, "[tpkbd] SC d=(%.1f,%.1f) v=%.0fpx/s cen=(%d,%d)\n",
+                uint64_t sample_ns = touch_scroll_time(mach_ns(), r[26] | (r[27] << 8));
+                scroll_velocity_update(sdx, sdy, (double)sample_ns / 1e6);
+                touch_scroll_push(dx, dy, sample_ns);
+                if (debug) fprintf(stderr, "[tpkbd] SC d=(%.1f,%.1f) v=%.0fpx/s cen=(%.1f,%.1f)\n",
                                    dx, dy, hypot(scrl_ema_x, scrl_ema_y) * 1000.0, cx, cy);
             } else {
                 scroll_active = 1;
                 gesture_send_maybegin();   // 手势开始: MayBegin(零增量)
+                touch_scroll_begin(mach_ns(), r[26] | (r[27] << 8));
             }
             last_cx = cx; last_cy = cy;
             have_last = 0;  // 滚动结束后光标重新锚定
@@ -1172,7 +1441,9 @@ static void handle_report(uint32_t cb_rid, uint8_t *r, CFIndex len) {
             } else {
                 int disp = abs(fx[s] - last_px) + abs(fy[s] - last_py);
                 mv_frames++;
-                if (!snap_done && mv_frames <= 10 && disp > move_slop) {
+                if (!btn_prev && !click && !mv_slop_done && !tap_pointer_moved &&
+                    move_slop > 0 && !snap_done && mv_frames <= 10 &&
+                    outside_move_slop(fx[s] - last_px, fy[s] - last_py)) {
                     // 落板跳变伪影: 落板后接触面稳定, 质心会单帧大跳(实测
                     // 10~18 counts, 方向朝掌侧=屏上向下)。它同时越过落指死区
                     // (外泄成漂移)和轻点位移阈值(废掉轻点)。窗口内首次大跳
@@ -1202,8 +1473,9 @@ static void handle_report(uint32_t cb_rid, uint8_t *r, CFIndex len) {
                     // counts, 不滤掉的话"轻点点按"会先漂一下再点击(落点偏下)。
                     // 死区内锚点保持不动, 越阈那帧的差分自带累计位移一次补发,
                     // 正常滑行无感(与 drag slop 的静默重锚语义不同)。
-                    int disp = abs(fx[s] - last_px) + abs(fy[s] - last_py);
-                    if (disp < move_slop) {
+                    // 与上方轻点识别使用同一个闭区间: 两轴都 <= move_slop。
+                    // 旧版 Manhattan 距离且用 <, 使 (7,7) 或 (0,14) 既移动又轻点。
+                    if (!outside_move_slop(fx[s] - last_px, fy[s] - last_py)) {
                         suppress = 1;
                     } else {
                         mv_slop_done = 1;
@@ -1217,6 +1489,10 @@ static void handle_report(uint32_t cb_rid, uint8_t *r, CFIndex len) {
                                        fx[s]-last_px, fy[s]-last_py, nx, ny);
                     clamp_to_screen(&nx, &ny);
                     avoid_gap(&nx, &ny, last_sx, last_sy);
+                    if (nx != (int)cur.x || ny != (int)cur.y) {
+                        tap_pointer_moved = 1;
+                        tap_moved = 1;
+                    }
                     // 按住期间必须发 Dragged 而非 Moved: 按下时板面下沉, 触点
                     // 天然有微小位移, 若在 Down/Up 之间插入 Moved, App 的点击
                     // 跟踪会取消该次点击(表现为"点按偶尔不灵")。
@@ -1452,6 +1728,18 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[tpkbd] 事件注入点 TPKB_TAP=%s\n", env);
     }
 
+    signal(SIGUSR1, scroll_trace_signal);
+    CFRunLoopTimerRef trace_timer = CFRunLoopTimerCreate(NULL, CFAbsoluteTimeGetCurrent(),
+                                                        0.25, 0, 0, scroll_trace_control, NULL);
+    if (trace_timer) {
+        CFRunLoopAddTimer(CFRunLoopGetMain(), trace_timer, kCFRunLoopDefaultMode);
+        CFRelease(trace_timer);
+    }
+    if ((env = getenv("TPKB_SCROLL_SMOOTH_MS")) != NULL) {
+        double value = strtod(env, NULL);
+        if (isfinite(value) && value >= 0 && value <= 40) scroll_smooth_ms = value;
+    }
+    scroll_frames_init();
     hid_api_init();
     update_display_bounds();
     CGDisplayRegisterReconfigurationCallback(display_reconfig_cb, NULL);

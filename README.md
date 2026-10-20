@@ -70,6 +70,7 @@ Everything is an environment variable in the plist — change and `launchctl boo
 |---|---|---|
 | `TPKB_MOVE_GAIN` | 1.8 | Pointer speed multiplier |
 | `TPKB_SCROLL_GAIN` | 2.2 | Scroll speed multiplier |
+| `TPKB_SCROLL_SMOOTH_MS` | 12 | Display-paced touch resampling buffer (ms), 0 disables; adds up to the buffer plus one refresh interval of input latency |
 | `TPKB_SCROLL_NATURAL` | 1 | 1 = natural scrolling |
 | `TPKB_TAPCLICK` | 1 | Tap-to-click |
 | `TPKB_TAP_RIGHT` | 0 | 2-finger tap = right click (off by default; 2-finger press is always right click) |
@@ -121,3 +122,7 @@ See [docs/devlog.md](docs/devlog.md) for the full reverse-engineering story, inc
 ## License
 
 [MIT](LICENSE), with the MMF-derived attribution notice included therein.
+
+## Development checks
+
+Run `./tests/run.sh` to check scroll precision, momentum velocity and event phases, including staggered finger releases. Tests inspect events in memory without posting mouse or scroll input; Xcode Command Line Tools are required. Perceived smoothness still needs testing on the target hardware.

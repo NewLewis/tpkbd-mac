@@ -70,11 +70,12 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.pjr.tpkbd-touchpad.p
 |---|---|---|
 | `TPKB_MOVE_GAIN` | 1.8 | 光标速度倍率 |
 | `TPKB_SCROLL_GAIN` | 2.2 | 滚动速度倍率 |
+| `TPKB_SCROLL_SMOOTH_MS` | 12 | 按屏幕刷新重采样的缓冲时长(ms)，0 关闭；增加的输入延迟上限约为缓冲加一个刷新周期 |
 | `TPKB_SCROLL_NATURAL` | 1 | 1=自然滚动 |
 | `TPKB_TAPCLICK` | 1 | 轻点点按 |
 | `TPKB_TAP_RIGHT` | 0 | 双指轻点=右键（默认关；双指物理按压始终是右键） |
 | `TPKB_DRAG_SLOP` | 12 | 按下瞬间的拖移抑制阈值（传感器 counts）：按压沉陷的微移被吞掉、点击保持干净（截图选窗等依赖）；0 关闭 |
-| `TPKB_MOVE_SLOP` | 14 | 落指死区（传感器 counts）≈ libinput 的 1.3mm 轻点位移阈值：落板沉降微移不动光标、也不取消轻点；越阈后一次性补发累计位移 |
+| `TPKB_MOVE_SLOP` | 14 | 落指死区（传感器 counts）≈ libinput 的 1.3mm 轻点位移阈值：轻点与移动共用每轴闭区间，避免微移既移动又点击；越阈后一次性补发累计位移 |
 | `TPKB_TAP_MS` | 250 | 轻点最长时长(ms) |
 | `TPKB_SWIPE3` | 1 | 三指手势 |
 | `TPKB_SWIPE3_GAIN` | 1.0 | 三指滑动速度 |
@@ -121,3 +122,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.pjr.tpkbd-touchpad.p
 ## 许可证
 
 [MIT](LICENSE)，其中含 MMF 衍生部分的署名声明。
+
+## 开发验证
+
+运行 `./tests/run.sh` 可验证滚动精度、惯性速度和手势相位，包含两指先后抬起的回放测试。测试只在内存中检查事件，不发送鼠标或滚动输入；需要 Xcode 命令行工具。实际滚动手感仍需在目标设备上验证。

@@ -20,7 +20,7 @@ cd "$(dirname "$0")"
 SIGN_ID="${SIGN_ID:-tpkbd-sign}"
 
 clang -O2 -Wall -framework CoreFoundation -framework IOKit \
-      -framework CoreGraphics -framework ApplicationServices \
+      -framework CoreGraphics -framework ApplicationServices -framework CoreVideo \
       -o tpkbd_touchpad tpkbd_touchpad.c
 
 if security find-identity -v -p codesigning | grep -q "\"$SIGN_ID\""; then
