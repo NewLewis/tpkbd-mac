@@ -20,6 +20,7 @@ ThinkPad X1 Tablet Thin Keyboard Gen 3（Chicony 代工，USB VID `17ef` PID `60
 | 单指轻点 | 左键 | <250ms 且位移 <1.3mm（取 libinput 阈值）才算点；落板跳变伪影已滤除；支持双击/三击连击 |
 | 双指移动 | 丝滑滚动 | 手势相位事件流——App 把它当真触控板而非鼠标滚轮 |
 | 双指甩动 | 惯性滚动 | 移植 Mac Mouse Fix 的触控板物理曲线 |
+| 双指捏合 / 张开 | 缩小 / 放大 | 原生缩放事件，需应用支持；同一次接触锁定滚动或缩放，抬指后可切换 |
 | 双指按压 | 右键 | 双指轻点=右键默认关（易误触），`TPKB_TAP_RIGHT=1` 可打开 |
 | 三指左右滑 | 切换桌面空间 / 全屏应用 | 跟手、回拉取消、按空间数自适应缩放 |
 | 三指上滑 / 下滑 | 调度中心 / App Exposé | |
@@ -72,6 +73,8 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.pjr.tpkbd-touchpad.p
 | `TPKB_MOVE_ACCEL` | 1 | 按手速加速；0 使用固定倍率。两种模式都保留小数位移 |
 | `TPKB_SCROLL_GAIN` | 2.2 | 滚动速度倍率 |
 | `TPKB_SCROLL_SMOOTH_MS` | 12 | 按屏幕刷新重采样的缓冲时长(ms)，0 关闭；增加的输入延迟上限约为缓冲加一个刷新周期 |
+| `TPKB_PINCH` | 1 | 双指捏合缩放开关，0 恢复仅双指滚动 |
+| `TPKB_PINCH_GAIN` | 1.0 | 缩放灵敏度（0.1～4），与自然滚动方向和光标速度独立 |
 | `TPKB_SCROLL_NATURAL` | 1 | 1=自然滚动 |
 | `TPKB_TAPCLICK` | 1 | 轻点点按 |
 | `TPKB_TAP_RIGHT` | 0 | 双指轻点=右键（默认关；双指物理按压始终是右键） |
@@ -110,7 +113,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.pjr.tpkbd-touchpad.p
 
 ## 已知限制
 
-- 无捏合缩放、无三指拖移、无压力感应（硬件无压感）。
+- 无三指拖移、无压力感应（硬件无压感）。
 - 打字锁定在 Secure Input 会话（密码框）内不生效——系统对 event tap 隐藏按键。
 - 只在一把键盘固件 + 一个 macOS 版本上实测。报文 ID 与布局是该设备的实证常量，不同固件可能不同。
 

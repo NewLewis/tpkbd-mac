@@ -58,6 +58,8 @@
 #include <CoreVideo/CoreVideo.h>
 #include "scroll_resampler.h"
 #include "pointer_motion.h"
+#include "two_finger_gesture.h"
+#include "magnify_event.h"
 
 #define VID               0x17ef
 #define PID               0x60b5
@@ -384,7 +386,7 @@ static uint64_t mach_ns(void) {
 
 // SIGUSR1: 30 秒有界采样。信号处理只置位, 热路径只写内存, 结束才输出日志。
 // R=设备触摸报文(ntips,触点槽位掩码,质心x*2,y*2,scanTime,按压),
-// S=发出的滚动事件(phase,momentum,dx,dy)。不监听键盘或其他设备。
+// S=滚动(phase,momentum,dx,dy), Z=缩放(phase,delta*1e6)。不监听键盘或其他设备。
 typedef struct {
     uint64_t ns;
     char kind;
@@ -393,11 +395,11 @@ typedef struct {
 static ScrollTraceRow scroll_trace_rows[16384];
 static size_t scroll_trace_count = 0;
 static uint64_t scroll_trace_start = 0;
+static uint64_t scroll_trace_duration = 30000000000ULL;
 static volatile sig_atomic_t scroll_trace_requested = 0;
 
 static void scroll_trace_signal(int signo) {
-    (void)signo;
-    scroll_trace_requested = 1;
+    scroll_trace_requested = signo == SIGUSR2 ? 2 : 1;
 }
 
 static void scroll_trace_record(char kind, int a, int b, int c, int d, int e, int f) {
@@ -405,19 +407,105 @@ static void scroll_trace_record(char kind, int a, int b, int c, int d, int e, in
     scroll_trace_rows[scroll_trace_count++] = (ScrollTraceRow){mach_ns(), kind, a, b, c, d, e, f};
 }
 
+// 在已授权的常驻进程内对照原生/合成手势。只在30秒采样窗口启用。
+static CFMachPortRef pinch_trace_taps[2];
+static CFRunLoopSourceRef pinch_trace_sources[2];
+static int pinch_trace_native_fields = 0;
+
+static CGEventRef pinch_trace_cb(CGEventTapProxy proxy, CGEventType type,
+                                 CGEventRef event, void *context) {
+    (void)proxy;
+    int layer = (int)(intptr_t)context;
+    if (type == kCGEventTapDisabledByTimeout || type == kCGEventTapDisabledByUserInput) {
+        if (scroll_trace_start && pinch_trace_taps[layer]) CGEventTapEnable(pinch_trace_taps[layer], true);
+        return event;
+    }
+    if (!scroll_trace_start || (type != 29 && type != 30)) return event;
+    int subtype = (int)CGEventGetIntegerValueField(event, 110);
+    int phase = (int)CGEventGetIntegerValueField(event, 132);
+    double delta = CGEventGetDoubleValueField(event, 113);
+    int ours = CGEventGetIntegerValueField(event, kCGEventSourceUserData) == 0x54504b42;
+    scroll_trace_record(layer ? 'H' : 'G', type, subtype, phase,
+                        (int)lround(fmax(-2000, fmin(2000, delta)) * 1000000), ours, 0);
+    if (!ours && layer == 0 && pinch_trace_native_fields < 8 && (subtype == 8 || subtype == 4)) {
+        pinch_trace_native_fields++;
+        fprintf(stderr, "[pinch-native] type=%u subtype=%d phase=%d delta=%.8f fields:",
+                type, subtype, phase, delta);
+        for (int field = 0; field < 200; field++) {
+            int64_t value = CGEventGetIntegerValueField(event, field);
+            double floating = CGEventGetDoubleValueField(event, field);
+            if (value || floating != 0)
+                fprintf(stderr, " %d=%lld/%.8g", field, (long long)value, floating);
+        }
+        fprintf(stderr, "\n");
+        CFTypeRef (*copy_hid)(CGEventRef) = dlsym(RTLD_DEFAULT, "CGEventCopyIOHIDEvent");
+        int (*get_type)(CFTypeRef) = dlsym(RTLD_DEFAULT, "IOHIDEventGetType");
+        uint64_t (*get_sender)(CFTypeRef) = dlsym(RTLD_DEFAULT, "IOHIDEventGetSenderID");
+        int (*get_phase)(CFTypeRef) = dlsym(RTLD_DEFAULT, "IOHIDEventGetPhase");
+        double (*get_double)(CFTypeRef, int) = dlsym(RTLD_DEFAULT, "IOHIDEventGetDoubleValue");
+        if (copy_hid && get_type && get_sender && get_phase && get_double) {
+            CFTypeRef hid = copy_hid(event);
+            if (hid) {
+                int ht = get_type(hid);
+                fprintf(stderr, "[pinch-hid] subtype=%d type=%d sender=%llu phase=%d fields:",
+                        subtype, ht, (unsigned long long)get_sender(hid), get_phase(hid));
+                for (int j = 0; j < 10; j++)
+                    fprintf(stderr, " %x=%.8g", (ht << 16) | j, get_double(hid, (ht << 16) | j));
+                fprintf(stderr, "\n");
+                CFRelease(hid);
+            } else fprintf(stderr, "[pinch-hid] subtype=%d no HID payload\n", subtype);
+        }
+    }
+    return event;
+}
+
+static void pinch_trace_start(void) {
+    pinch_trace_native_fields = 0;
+    CGEventTapLocation locations[] = {kCGHIDEventTap, kCGSessionEventTap};
+    for (int i = 0; i < 2; i++) {
+        pinch_trace_taps[i] = CGEventTapCreate(locations[i], kCGHeadInsertEventTap,
+            kCGEventTapOptionListenOnly, CGEventMaskBit(29) | CGEventMaskBit(30),
+            pinch_trace_cb, (void *)(intptr_t)i);
+        if (!pinch_trace_taps[i]) continue;
+        pinch_trace_sources[i] = CFMachPortCreateRunLoopSource(NULL, pinch_trace_taps[i], 0);
+        if (pinch_trace_sources[i])
+            CFRunLoopAddSource(CFRunLoopGetMain(), pinch_trace_sources[i], kCFRunLoopDefaultMode);
+        CGEventTapEnable(pinch_trace_taps[i], true);
+        fprintf(stderr, "[pinch-trace] layer=%d enabled=%d\n", i, CGEventTapIsEnabled(pinch_trace_taps[i]));
+    }
+}
+
+static void pinch_trace_stop(void) {
+    for (int i = 0; i < 2; i++) {
+        if (pinch_trace_sources[i]) {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), pinch_trace_sources[i], kCFRunLoopDefaultMode);
+            CFRelease(pinch_trace_sources[i]); pinch_trace_sources[i] = NULL;
+        }
+        if (pinch_trace_taps[i]) {
+            CFMachPortInvalidate(pinch_trace_taps[i]);
+            CFRelease(pinch_trace_taps[i]); pinch_trace_taps[i] = NULL;
+        }
+    }
+}
+
 static void scroll_trace_control(CFRunLoopTimerRef timer, void *context) {
     (void)timer; (void)context;
     if (scroll_trace_requested) {
+        int request = scroll_trace_requested;
         scroll_trace_requested = 0;
         if (!scroll_trace_start) {
+            scroll_trace_duration = request == 2 ? 90000000000ULL : 30000000000ULL;
             scroll_trace_count = 0;
             scroll_trace_start = mach_ns();
-            fprintf(stderr, "[scroll-trace] START: recording touch/scroll timing for 30 seconds\n");
+            pinch_trace_start();
+            fprintf(stderr, "[scroll-trace] START: recording touch/gesture timing for %llu seconds\n",
+                    (unsigned long long)(scroll_trace_duration / 1000000000));
         }
     }
-    if (!scroll_trace_start || mach_ns() - scroll_trace_start < 30000000000ULL) return;
+    if (!scroll_trace_start || mach_ns() - scroll_trace_start < scroll_trace_duration) return;
     uint64_t start = scroll_trace_start;
     scroll_trace_start = 0;
+    pinch_trace_stop();
     fprintf(stderr, "[scroll-trace] DATA: us,kind,a,b,c,d,e,f\n");
     for (size_t i = 0; i < scroll_trace_count; i++) {
         ScrollTraceRow *r = &scroll_trace_rows[i];
@@ -549,6 +637,77 @@ static void touch_scroll_finish(void) {
     scroll_resampler_read(&touch_resampler, UINT64_MAX, &dx, &dy);
     post_gesture_scroll(dx, dy);
     touch_resampling = 0;
+}
+
+// ---- 双指捏合: 原生 magnify 事件, 距离比与自然滚动方向独立 ----
+static int pinch_on = 1;            // TPKB_PINCH
+static double pinch_gain = 1.0;     // TPKB_PINCH_GAIN
+static int pinch_active = 0;
+static int pinch_sent = 0;          // Began accompanies the first nonzero delta
+static int pinch_tail = 0;          // 捏合后残留的一根手指不应移动光标
+static double pinch_last_distance = 0;
+static CGPoint pinch_location;
+static ScrollResampler pinch_resampler; // x=log(distance ratio), y=0
+static TwoFingerGesture two_finger;
+
+static void post_pinch_event(double log_delta, int phase) {
+    double delta = expm1(log_delta * pinch_gain);
+    CGEventRef event = magnify_event_create(pinch_location, delta, phase, mach_ns());
+    if (!event) return;
+    scroll_trace_record('Z', phase, (int)lround(fmax(-2000, fmin(2000, delta)) * 1000000),
+                        0, 0, 0, 0);
+    // Match the magnification injection path used by TouchSimulator. Let the
+    // WindowServer route the gesture before it reaches application event taps.
+    CGEventPost(kCGHIDEventTap, event);
+    CFRelease(event);
+}
+
+static void pinch_emit_at(uint64_t ns) {
+    double delta, unused;
+    scroll_resampler_read(&pinch_resampler, ns, &delta, &unused);
+    if (fabs(delta) <= 1e-10) return;
+    // Safari's TabContentView only starts its tab picker for a negative Began.
+    // A zero Began followed by negative Changed events only zooms the page.
+    post_pinch_event(delta, pinch_sent ? PH_CHANGED : PH_BEGAN);
+    pinch_sent = 1;
+}
+
+static void pinch_tick(uint64_t ns) {
+    if (!pinch_active) return;
+    uint64_t delay = (uint64_t)(scroll_smooth_ms * 1e6);
+    pinch_emit_at(ns > delay ? ns - delay : 0);
+}
+
+static void pinch_begin(CGPoint location, double initial_distance,
+                        uint64_t initial_ns, uint64_t ns, uint16_t scan) {
+    pinch_active = 1;
+    pinch_sent = 0;
+    pinch_tail = 0;
+    pinch_last_distance = initial_distance;
+    pinch_location = location;
+    touch_sample_ns = ns;
+    touch_scan_previous = scan;
+    scroll_resampler_begin(&pinch_resampler, initial_ns);
+    if (scroll_smooth_ms > 0) scroll_frames_start();
+}
+
+static void pinch_move(double distance, uint64_t ns) {
+    if (distance < 40) return; // Avoid a singular ratio when fingers nearly meet.
+    double delta = log(distance / pinch_last_distance);
+    pinch_last_distance = distance;
+    scroll_resampler_push(&pinch_resampler, ns, delta, 0);
+    if (scroll_smooth_ms == 0) pinch_emit_at(UINT64_MAX);
+}
+
+static void pinch_finish(int cancelled) {
+    if (!pinch_active) return;
+    pinch_emit_at(UINT64_MAX);
+    if (pinch_sent) post_pinch_event(0, cancelled ? PH_CANCELLED : PH_ENDED);
+    pinch_active = 0;
+    pinch_sent = 0;
+    two_finger.mode = TWO_NONE;
+    tap_moved = 1;
+    scroll_frames_stop_if_idle();
 }
 
 // 惯性滚动帧: 只发 type22, field99=Undefined + 动量相位
@@ -714,6 +873,7 @@ static void scroll_frame_perform(void *context) {
     (void)context;
     if (!scroll_frames_running) return;
     touch_scroll_tick(mach_ns());
+    pinch_tick(mach_ns());
     if (mom_active) mom_timer_cb(NULL, NULL);
     scroll_frames_stop_if_idle();
 }
@@ -785,13 +945,14 @@ static void scroll_frames_start(void) {
     else if (!scroll_display_link || !CVDisplayLinkIsRunning(scroll_display_link)) {
         // 两种时钟都失败时恢复直通, 避免无输出。
         touch_scroll_finish();
+        pinch_finish(1);
         mom_active = 0;
         scroll_frames_stop_if_idle();
     }
 }
 
 static void scroll_frames_stop_if_idle(void) {
-    if (!scroll_frames_running || touch_resampling || mom_active) return;
+    if (!scroll_frames_running || touch_resampling || pinch_active || mom_active) return;
     scroll_frames_running = 0;
     if (scroll_display_link) CVDisplayLinkStop(scroll_display_link);
     if (scroll_frame_fallback) {
@@ -1295,6 +1456,21 @@ static void handle_report(uint32_t cb_rid, uint8_t *r, CFIndex len) {
     // 惯性滚动中: 任何新接触或物理按压都立即截停(同 macOS 触控板行为)
     if (mom_active && (ntips > 0 || click)) mom_stop();
 
+    if (pinch_active && (ntips != 2 || click || btn_prev || swallow || !pinch_on)) {
+        pinch_finish(ntips >= 3 || click || btn_prev || swallow || !pinch_on);
+        pinch_tail = ntips == 1;
+    }
+    if (ntips != 1) pinch_tail = 0;
+    if (pinch_tail && !click && !btn_prev && !swallow) {
+        have_last = 0; touch_now = 1; tap_moved = 1;
+        return;
+    }
+    if (ntips < 2 && !scroll_active) two_finger.mode = TWO_NONE;
+    if (ntips >= 3 || click || btn_prev || swallow) {
+        two_finger.mode = TWO_NONE;
+        if (click || btn_prev || swallow) scrl_ema_x = scrl_ema_y = 0;
+    }
+
     // 双指先后抬起会经历 2→1→0。旧逻辑在 2→1 启动惯性, 下一帧仍有
     // 一指便立即截停。给剩余手指 60ms 抬起窗口, 等全部离板再决定惯性。
     // 窗口内不把残留手指误当指针移动; 超时则回到单指移动, 不启动惯性。
@@ -1322,7 +1498,7 @@ static void handle_report(uint32_t cb_rid, uint8_t *r, CFIndex len) {
     // 三指手势收尾(抬指/降为双指): 三指在板期间不发移动/滚动
     if (swipe3_active && (ntips < 3 || !swipe3_on)) swipe3_end();
 
-    if (ntips >= 3 && swipe3_on && !swallow && !btn_prev) {
+    if (ntips >= 3 && swipe3_on && !swallow && !btn_prev && !click) {
         // ---- 三指: 左右滑切换全屏应用/桌面空间 (dock swipe) ----
         // 物理按住期间不进此分支: 按住时一切触摸都是拖移(同原生触控板)。
         // 质心 = 最早按下的最多三个指尖
@@ -1361,6 +1537,7 @@ static void handle_report(uint32_t cb_rid, uint8_t *r, CFIndex len) {
         else { scrl_ema_x = scrl_ema_y = 0; }
         have_last = 0;
         scroll_active = 0;
+        two_finger.mode = TWO_NONE;
 
         // ---- 轻点点按判定 (抬指时回溯评估) ----
         // 条件: 时长<阈值 + 两轴位移均在 move_slop 内 + 未移动光标/滚动。
@@ -1383,8 +1560,8 @@ static void handle_report(uint32_t cb_rid, uint8_t *r, CFIndex len) {
         }
         tap_active = 0; tap_nfid = 0; tap_moved = 0;
         type_grandf = 0;   // 在板手势结束, 后续新触摸按锁定规则处理
-    } else if (ntips >= 2 && !swallow && !btn_prev) {
-        // ---- 两指滚动: 用最早按下的两个活跃槽位的质心 ----
+    } else if (ntips >= 2 && !swallow && !btn_prev && !click) {
+        // ---- 双指分流: 平移滚动、改变间距捏合; 按 ContactID 跟踪 ----
         // (物理按住期间让位给拖移, 不滚动)
         int s1 = -1, s2 = -1;
         for (int k = 0; k < 2; k++) {
@@ -1402,27 +1579,61 @@ static void handle_report(uint32_t cb_rid, uint8_t *r, CFIndex len) {
         if (s1 >= 0 && s2 >= 0) {
             double cx = (fx[s1] + fx[s2]) * 0.5;
             double cy = (fy[s1] + fy[s2]) * 0.5;
-            // scroll_active 兼作锚定标志: 首帧只记质心, 之后帧间差分发滚动。
-            // (曾有 bug: 差分门控用 have_last, 而本分支每帧末尾清零它, 导致永远不发滚动)
-            if (scroll_active) {
-                double dx = (cx - last_cx) * scroll_gain;
-                double dy = (cy - last_cy) * scroll_gain;
-                // 速度估计(屏上方向, px/ms, 真实时基): 每帧更新, 停住时 EMA
-                // 自然衰减到 0, "停顿后松手"不会误触发惯性。
-                double sdx = natural ? dx : -dx;
-                double sdy = natural ? dy : -dy;
-                uint64_t sample_ns = touch_scroll_time(mach_ns(), r[26] | (r[27] << 8));
-                scroll_velocity_update(sdx, sdy, (double)sample_ns / 1e6);
-                touch_scroll_push(dx, dy, sample_ns);
-                if (debug) fprintf(stderr, "[tpkbd] SC d=(%.1f,%.1f) v=%.0fpx/s cen=(%.1f,%.1f)\n",
-                                   dx, dy, hypot(scrl_ema_x, scrl_ema_y) * 1000.0, cx, cy);
-            } else {
+            double distance = hypot((double)fx[s2] - fx[s1], (double)fy[s2] - fy[s1]);
+            uint64_t received_ns = mach_ns();
+            uint16_t scan = r[26] | (r[27] << 8);
+            if (!two_finger_same_contacts(&two_finger, contact_id[s1], contact_id[s2])) {
+                // 换指/固件换 ContactID 时重锚, 不能把新接触位置当成巨大缩放。
+                pinch_finish(1);
+                if (scroll_active) {
+                    scrl_ema_x = scrl_ema_y = 0;
+                    end_scroll_gesture();
+                }
+                two_finger_begin(&two_finger, contact_id[s1], contact_id[s2],
+                                 cx, cy, distance, received_ns);
                 scroll_active = 1;
-                gesture_send_maybegin();   // 手势开始: MayBegin(零增量)
-                touch_scroll_begin(mach_ns(), r[26] | (r[27] << 8));
+                gesture_send_maybegin();
+                touch_sample_ns = received_ns;
+                touch_scan_previous = scan;
+                // 直通兼容模式保留原来的滚动起步时序。
+                if (!pinch_on || ntips != 2) {
+                    two_finger.mode = TWO_SCROLL;
+                    touch_scroll_begin(received_ns, scan);
+                }
+            } else {
+                int was_pending = two_finger.mode == TWO_PENDING;
+                int mode = two_finger_classify(&two_finger, cx, cy, distance, pinch_on && ntips == 2);
+                uint64_t sample_ns = touch_scroll_time(received_ns, scan);
+                if (mode == TWO_PINCH) {
+                    if (!pinch_active) {
+                        // 未确定时只发过滚动 MayBegin: Cancelled 收回, 不生成滚动或惯性。
+                        scrl_ema_x = scrl_ema_y = 0;
+                        end_scroll_gesture();
+                        scroll_active = 0;
+                        pinch_begin(cur, two_finger.distance, two_finger.began_ns,
+                                    sample_ns, scan);
+                    }
+                    pinch_move(distance, sample_ns);
+                    tap_moved = 1;
+                } else {
+                    double dx = (cx - last_cx) * scroll_gain;
+                    double dy = (cy - last_cy) * scroll_gain;
+                    scroll_velocity_update(natural ? dx : -dx, natural ? dy : -dy,
+                                           (double)sample_ns / 1e6);
+                    if (mode == TWO_SCROLL) {
+                        if (was_pending) {
+                            touch_scroll_begin(sample_ns, scan);
+                            if (touch_resampling)
+                                scroll_resampler_begin(&touch_resampler, two_finger.began_ns);
+                            dx = (cx - two_finger.cx) * scroll_gain;
+                            dy = (cy - two_finger.cy) * scroll_gain;
+                        }
+                        touch_scroll_push(dx, dy, sample_ns);
+                    }
+                }
             }
             last_cx = cx; last_cy = cy;
-            have_last = 0;  // 滚动结束后光标重新锚定
+            have_last = 0;
         }
     } else if (!swallow) {
         // ---- 指针移动: 差分 × 速度增益, 保留小数余量 ----
@@ -1431,6 +1642,7 @@ static void handle_report(uint32_t cb_rid, uint8_t *r, CFIndex len) {
         // 另一指接管指针(选中长文本就靠它), 换跟指当帧只锚定不跳动。
         if (scroll_active) end_scroll_gesture();   // 双指变单指: 手势收尾
         scroll_active = 0;
+        two_finger.mode = TWO_NONE;
         int s = -1, sseq = 0;
         for (int i = 0; i < NFINGER; i++)
             if (tips[i] && down_seq[i] > sseq) { sseq = down_seq[i]; s = i; }
@@ -1710,6 +1922,13 @@ static void device_attached(void *context, IOReturn result,
 static void device_detached(void *context, IOReturn result,
                             void *sender, IOHIDDeviceRef device) {
     (void)context; (void)result; (void)sender; (void)device;
+    pinch_finish(1);
+    if (scroll_active) {
+        scrl_ema_x = scrl_ema_y = 0;
+        end_scroll_gesture();
+        scroll_active = 0;
+    }
+    two_finger.mode = TWO_NONE; pinch_tail = 0; have_last = 0;
     fprintf(stderr, "[tpkbd] 设备断开\n");
 }
 
@@ -1727,6 +1946,11 @@ int main(int argc, char **argv) {
     if ((env = getenv("TPKB_SCROLL_NATURAL")) != NULL) natural    = atoi(env);
     if ((env = getenv("TPKB_MOMENTUM"))      != NULL) momentum_on = atoi(env);
     if ((env = getenv("TPKB_DRAG_A"))        != NULL) mom_drag_a  = atof(env);
+    if ((env = getenv("TPKB_PINCH")) != NULL) pinch_on = atoi(env) != 0;
+    if ((env = getenv("TPKB_PINCH_GAIN")) != NULL) {
+        double value = strtod(env, NULL);
+        if (isfinite(value) && value >= 0.1 && value <= 4) pinch_gain = value;
+    }
     if ((env = getenv("TPKB_SWIPE3"))        != NULL) swipe3_on   = atoi(env);
     if ((env = getenv("TPKB_SWIPE3_GAIN"))   != NULL) swipe3_gain = atof(env);
     if ((env = getenv("TPKB_TAPCLICK"))      != NULL) tap_on      = atoi(env);
@@ -1759,6 +1983,7 @@ int main(int argc, char **argv) {
     }
 
     signal(SIGUSR1, scroll_trace_signal);
+    signal(SIGUSR2, scroll_trace_signal);
     CFRunLoopTimerRef trace_timer = CFRunLoopTimerCreate(NULL, CFAbsoluteTimeGetCurrent(),
                                                         0.25, 0, 0, scroll_trace_control, NULL);
     if (trace_timer) {
@@ -1773,6 +1998,8 @@ int main(int argc, char **argv) {
             move_acceleration ? "开" : "关", move_gain,
             pointer_motion_gain(0, move_gain, move_acceleration),
             pointer_motion_gain(1500, move_gain, move_acceleration));
+    fprintf(stderr, "[tpkbd] 双指捏合=%s gain=%.2f, 与滚动分流, 按压优先拖移\n",
+            pinch_on ? "开" : "关", pinch_gain);
     scroll_frames_init();
     hid_api_init();
     update_display_bounds();

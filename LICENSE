@@ -23,7 +23,7 @@ SOFTWARE.
 ---
 
 Attribution notice: portions of the gesture-synthesis design in this project
-(gesture-phase scroll event structure, momentum scroll physics parameters,
+(gesture-phase scroll and magnification event structures, momentum scroll physics parameters,
 and the DockSwipe event construction for Mission Control / space switching)
 are derived from the Mac Mouse Fix source code (https://github.com/noah-nuebling/mac-mouse-fix),
 used under the MMF License. This notice fulfills the MMF License requirement

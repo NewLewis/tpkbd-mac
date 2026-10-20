@@ -20,6 +20,7 @@ It turns out the touchpad also implements the **standard HID multitouch digitize
 | 1-finger tap | Left click | <250 ms and <1.3 mm of travel (libinput's threshold); landing-snap artifacts are filtered; supports double/triple tap |
 | 2-finger move | Smooth scrolling | Gesture-phase event stream — apps treat it like a real trackpad, not a mouse wheel |
 | 2-finger flick | Momentum scrolling | Physics curve ported from Mac Mouse Fix's trackpad-like defaults |
+| 2-finger pinch / spread | Zoom out / in | Native magnify events in supporting apps; lift and touch again to switch between scrolling and zooming |
 | 2-finger press | Right click | 2-finger *tap*-right-click is off by default (easy to trigger accidentally) — enable with `TPKB_TAP_RIGHT=1` |
 | 3-finger swipe left/right | Switch desktop space / full-screen app | Follows the finger, pull back to cancel |
 | 3-finger swipe up / down | Mission Control / App Exposé | |
@@ -72,6 +73,8 @@ Everything is an environment variable in the plist — change and `launchctl boo
 | `TPKB_MOVE_ACCEL` | 1 | Speed-dependent pointer acceleration; 0 uses fixed gain. Both modes preserve fractional travel |
 | `TPKB_SCROLL_GAIN` | 2.2 | Scroll speed multiplier |
 | `TPKB_SCROLL_SMOOTH_MS` | 12 | Display-paced touch resampling buffer (ms), 0 disables; adds up to the buffer plus one refresh interval of input latency |
+| `TPKB_PINCH` | 1 | Pinch-to-zoom; 0 restores scroll-only two-finger handling |
+| `TPKB_PINCH_GAIN` | 1.0 | Zoom sensitivity (0.1–4); independent of natural scrolling and pointer speed |
 | `TPKB_SCROLL_NATURAL` | 1 | 1 = natural scrolling |
 | `TPKB_TAPCLICK` | 1 | Tap-to-click |
 | `TPKB_TAP_RIGHT` | 0 | 2-finger tap = right click (off by default; 2-finger press is always right click) |
@@ -110,7 +113,7 @@ See [docs/devlog.md](docs/devlog.md) for the full reverse-engineering story, inc
 
 ## Limitations
 
-- No pinch-to-zoom, no three-finger-drag, no force click (hardware has no pressure sensor). 
+- No three-finger-drag, no force click (hardware has no pressure sensor).
 - Typing lock does not apply inside Secure Input sessions (password fields) — the system hides key events from event taps there.
 - Tested on exactly one keyboard firmware and one macOS version. Report IDs and the report layout are verified constants for this device; a different firmware may differ.
 

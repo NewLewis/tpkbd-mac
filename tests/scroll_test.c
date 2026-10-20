@@ -16,6 +16,9 @@ static int sample_count;
 typedef struct { CGEventType type; CGPoint point; int count; } MouseSample;
 static MouseSample mouse_samples[4096];
 static int mouse_count;
+typedef struct { int phase; double delta; CGPoint point; } PinchSample;
+static PinchSample pinch_samples[4096];
+static int pinch_count;
 static CGPoint test_cursor = {500, 500};
 static CGPoint test_event_location(CGEventRef event) {
     return CGEventGetType(event) == kCGEventNull ? test_cursor : CGEventGetLocation(event);
@@ -23,6 +26,13 @@ static CGPoint test_event_location(CGEventRef event) {
 static void capture_event(CGEventTapLocation tap, CGEventRef event) {
     (void)tap;
     CGEventType type = CGEventGetType(event);
+    if (type == 29 && CGEventGetIntegerValueField(event, 110) == 8) {
+        assert(tap == kCGHIDEventTap);
+        assert(pinch_count < 4096);
+        pinch_samples[pinch_count++] = (PinchSample){
+            (int)CGEventGetIntegerValueField(event, 132),
+            CGEventGetDoubleValueField(event, 113), CGEventGetLocation(event)};
+    }
     if (type == kCGEventMouseMoved || type == kCGEventLeftMouseDown ||
         type == kCGEventLeftMouseUp || type == kCGEventLeftMouseDragged ||
         type == kCGEventRightMouseDown || type == kCGEventRightMouseUp ||
@@ -55,9 +65,12 @@ static void capture_event(CGEventTapLocation tap, CGEventRef event) {
 
 static void reset(void) {
     touch_resampling = 0;
+    pinch_active = pinch_sent = pinch_tail = 0;
+    pinch_on = 0; pinch_gain = 1;
+    two_finger = (TwoFingerGesture){0};
     scroll_smooth_ms = 0;
     mom_stop();
-    sample_count = mouse_count = 0;
+    sample_count = mouse_count = pinch_count = 0;
     test_cursor = CGPointMake(500, 500);
     screen_bounds = CGRectMake(0, 0, 2000, 1500);
     g_display_count = 1; g_display_bounds[0] = screen_bounds;
@@ -467,7 +480,164 @@ static void pointer_precision_and_acceleration(void) {
     assert(test_cursor.x == 1997);
 }
 
+static void pair_report(int x1, int y1, int x2, int y2, int mask, int button, int id2) {
+    uint8_t r[30] = {3};
+    int xs[] = {x1, x2}, ys[] = {y1, y2};
+    for (int i = 0; i < 2; i++) {
+        r[1 + i * 5] = ((mask & (1 << i)) ? 3 : 0) | ((i ? id2 : 0) << 2);
+        r[2 + i * 5] = xs[i] & 255; r[3 + i * 5] = xs[i] >> 8;
+        r[4 + i * 5] = ys[i] & 255; r[5 + i * 5] = ys[i] >> 8;
+    }
+    r[28] = !!(mask & 1) + !!(mask & 2); r[29] = button;
+    test_time_ms += 7;
+    handle_report(3, r, sizeof(r));
+}
+
+static double pinch_scale(void) {
+    double scale = 1;
+    assert(pinch_count >= 3 && pinch_samples[0].phase == PH_BEGAN);
+    for (int i = 0; i < pinch_count; i++) {
+        assert(isfinite(pinch_samples[i].delta));
+        assert(pinch_samples[i].point.x == 500 && pinch_samples[i].point.y == 500);
+        scale *= 1 + pinch_samples[i].delta;
+        if (i > 0 && i < pinch_count - 1) assert(pinch_samples[i].phase == PH_CHANGED);
+    }
+    assert(pinch_samples[pinch_count - 1].phase == PH_ENDED);
+    return scale;
+}
+
+static void pinch_gestures(void) {
+    // Outward, inward and reversed gestures preserve the distance ratio.
+    for (int reverse = 0; reverse < 3; reverse++) {
+        reset(); pinch_on = 1; natural = 0;
+        pair_report(400, 400, 600, 400, 3, 0, 1);
+        for (int i = 1; i <= 10; i++) {
+            int d = reverse == 1 ? -i * 5 : i * 5;
+            pair_report(400 - d, 400, 600 + d, 400, 3, 0, 1);
+        }
+        if (reverse == 2) for (int i = 9; i >= 0; i--)
+            pair_report(400 - i * 5, 400, 600 + i * 5, 400, 3, 0, 1);
+        pair_report(400, 400, 600, 400, 0, 0, 1);
+        assert(fabs(pinch_scale() - (reverse == 0 ? 1.5 : reverse == 1 ? 0.5 : 1)) < 1e-5);
+        assert(reverse == 1 ? pinch_samples[0].delta < 0 : pinch_samples[0].delta > 0);
+        assert(!mom_active && mouse_count == 0 && !pinch_active);
+        for (int i = 0; i < sample_count; i++)
+            assert(samples[i].x == 0 && samples[i].y == 0); // No accidental scrolling.
+    }
+    // One finger can stay still; common translation must not steal that pinch.
+    reset(); pinch_on = 1;
+    pair_report(400, 400, 600, 400, 3, 0, 1);
+    for (int i = 1; i <= 10; i++) pair_report(400, 400, 600 + i * 4, 400, 3, 0, 1);
+    pair_report(400, 400, 640, 400, 0, 0, 1);
+    assert(fabs(pinch_scale() - 1.2) < 1e-5);
+
+    // Both fingers translating remains the existing scroll path, including
+    // after later distance changes. The choice is locked until contact changes.
+    reset(); pinch_on = 1; momentum_on = 0;
+    pair_report(400, 400, 600, 400, 3, 0, 1);
+    for (int i = 1; i <= 10; i++) pair_report(400, 400 + i * 5, 600, 400 + i * 5, 3, 0, 1);
+    pair_report(380, 450, 620, 450, 3, 0, 1);
+    pair_report(380, 450, 620, 450, 0, 0, 1);
+    int distance = 0;
+    for (int i = 0; i < sample_count; i++) distance += samples[i].y;
+    assert(pinch_count == 0 && distance == 100);
+
+    // The display-paced scroll path still preserves full distance with pinch on.
+    reset(); pinch_on = 1; momentum_on = 0; scroll_smooth_ms = 12;
+    pair_report(400, 400, 600, 400, 3, 0, 1);
+    for (int i = 1; i <= 10; i++) {
+        pair_report(400, 400 + i * 5, 600, 400 + i * 5, 3, 0, 1);
+        touch_scroll_tick(mach_ns());
+    }
+    pair_report(400, 450, 600, 450, 0, 0, 1);
+    distance = 0;
+    for (int i = 0; i < sample_count; i++) distance += samples[i].y;
+    assert(pinch_count == 0 && distance == 100 && !touch_resampling);
+
+    // Tiny relative jitter and an isolated landing jump must never magnify.
+    reset(); pinch_on = 1;
+    pair_report(400, 400, 600, 400, 3, 0, 1);
+    for (int i = 0; i < 10; i++) pair_report(400 - i % 2, 400, 600 + i % 2, 400, 3, 0, 1);
+    pair_report(390, 400, 610, 400, 3, 0, 1);
+    for (int i = 0; i < 5; i++) pair_report(390, 400, 610, 400, 3, 0, 1);
+    pair_report(390, 400, 610, 400, 0, 0, 1);
+    assert(pinch_count == 0);
+
+    // Release one finger: complete zoom once and swallow its residual movement.
+    reset(); pinch_on = 1; scroll_smooth_ms = 12;
+    pair_report(400, 400, 600, 400, 3, 0, 1);
+    for (int i = 1; i <= 10; i++) {
+        pair_report(400 - i * 5, 400, 600 + i * 5, 400, 3, 0, 1);
+        pinch_tick(mach_ns());
+    }
+    pair_report(350, 400, 650, 400, 1, 0, 1);
+    assert(fabs(pinch_scale() - 1.5) < 1e-5);
+    int count = pinch_count;
+    pair_report(350, 420, 650, 400, 1, 0, 1);
+    pinch_tick(mach_ns() + 100000000);
+    assert(mouse_count == 0 && pinch_count == count);
+    pair_report(350, 420, 650, 400, 0, 0, 1);
+    assert(!pinch_tail);
+
+    // A short buffered pinch can end before its first display tick. Its first
+    // event still carries the actual direction, and flushing preserves scale.
+    for (int inward = 0; inward < 2; inward++) {
+        reset(); pinch_on = 1; scroll_smooth_ms = 12;
+        int sign = inward ? -1 : 1;
+        pair_report(400, 400, 600, 400, 3, 0, 1);
+        pair_report(400 - sign * 5, 400, 600 + sign * 5, 400, 3, 0, 1);
+        pair_report(400 - sign * 10, 400, 600 + sign * 10, 400, 3, 0, 1);
+        assert(pinch_active && !pinch_sent && pinch_count == 0);
+        pair_report(400 - sign * 10, 400, 600 + sign * 10, 400, 0, 0, 1);
+        assert(pinch_count == 2 && pinch_samples[0].phase == PH_BEGAN);
+        assert(pinch_samples[1].phase == PH_ENDED);
+        assert(fabs(pinch_samples[0].delta - sign * 0.1) < 1e-5);
+        assert(!pinch_active && !pinch_sent);
+    }
+
+    // A replacement contact closes the old gesture rather than zooming by the
+    // unrelated distance. Pressing during zoom also sends a proper cancellation.
+    reset(); pinch_on = 1;
+    pair_report(400, 400, 600, 400, 3, 0, 1);
+    pair_report(395, 400, 605, 400, 3, 0, 1);
+    pair_report(390, 400, 610, 400, 3, 0, 1);
+    assert(pinch_active);
+    pair_report(200, 400, 1000, 400, 3, 0, 2);
+    assert(!pinch_active && pinch_samples[pinch_count - 1].phase == PH_CANCELLED);
+
+    reset(); pinch_on = 1;
+    pair_report(400, 400, 600, 400, 3, 0, 1);
+    pair_report(395, 400, 605, 400, 3, 0, 1);
+    pair_report(390, 400, 610, 400, 3, 0, 1);
+    pair_report(390, 400, 610, 400, 3, 1, 1);
+    assert(!pinch_active && pinch_samples[pinch_count - 1].phase == PH_CANCELLED);
+
+    reset(); pinch_on = 1;
+    pair_report(400, 400, 600, 400, 3, 0, 1);
+    pair_report(395, 400, 605, 400, 3, 0, 1);
+    pair_report(390, 400, 610, 400, 3, 0, 1);
+    report(3, 400, 400);
+    assert(!pinch_active && pinch_samples[pinch_count - 1].phase == PH_CANCELLED);
+
+    // User's posture: index holds left button, middle finger moves to drag.
+    reset(); pinch_on = 1;
+    pointer_report(1, 400, 400, 0, 7);
+    pointer_report(1, 400, 400, 1, 7);
+    pair_report(400, 400, 600, 400, 3, 1, 1);
+    pair_report(400, 400, 650, 420, 3, 1, 1);
+    assert(pinch_count == 0 && mouse_samples[0].type == kCGEventLeftMouseDown);
+    assert(mouse_samples[mouse_count - 1].type == kCGEventLeftMouseDragged);
+
+    reset(); pinch_on = 1;
+    pair_report(400, 400, 600, 400, 3, 0, 1);
+    pair_report(395, 400, 605, 400, 3, 0, 1);
+    pair_report(390, 400, 610, 400, 3, 0, 1);
+    device_detached(NULL, 0, NULL, NULL);
+    assert(!pinch_active && pinch_samples[pinch_count - 1].phase == PH_CANCELLED);
+}
+
 int main(void) {
+    pinch_gestures();
     pointer_precision_and_acceleration();
     tap_no_drift();
     slow_scroll();
@@ -477,6 +647,6 @@ int main(void) {
     staggered_lift();
     resampler_cadence();
     resampled_gesture();
-    puts("PASS: pointer fractions/velocity curve/cadence/reversal/edges, tap boundaries/no drift, multi-click, movement cancellation/drag, slow scroll precision, fractional fields, distance/direction, time-based velocity, pause/reversal, momentum phases/distance, staggered lift, 60/75/120Hz resampling, USB jitter, scan clock wrap, flush/no drift");
+    puts("PASS: pinch ratios/phases/arbitration/jitter/contact changes/drag priority, pointer fractions/velocity curve/cadence/reversal/edges, tap boundaries/no drift, multi-click, movement cancellation/drag, slow scroll precision, fractional fields, distance/direction, time-based velocity, pause/reversal, momentum phases/distance, staggered lift, 60/75/120Hz resampling, USB jitter, scan clock wrap, flush/no drift");
     return 0;
 }

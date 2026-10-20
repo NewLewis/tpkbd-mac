@@ -159,3 +159,23 @@ finger k 数据起于 r[1+5k] (k=0..4), 每指 5 字节:
 - 新增 `TPKB_MOVE_ACCEL=0` 对照固定倍率模式（仍保留小数位移），`TPKB_MOVE_GAIN` 作为两种模式的基础倍率。
 
 验证：固定 1.8 倍时十个 1-count 输入精确输出 18 像素；正反向累计距离对称；同样 100 counts 行程慢速输出 90 像素、快速输出 360 像素。另覆盖增益连续/单调/有界、不同上报频率同速、时钟回绕/USB 抖动、快速减速、静止轴不漂移、换指/滚动恢复/边缘的状态重置。完整轻点防漂移、连击、拖动及滚动回归在 ASan/UBSan 下通过。硬件的触摸坐标分辨率及现有落指死区仍是精度边界。
+
+## 双指捏合缩放（2026-10-20）
+
+新增与滚动分流的原生缩放事件：采用 [Mac Mouse Fix TouchSimulator](https://github.com/noah-nuebling/mac-mouse-fix/blob/master/Helper/Core/Touch/TouchSimulator.m) 的 type-29/subtype-8 布局，field 113 为增量 magnification、field 132 为 IOHID 手势相位。AppKit 内存转换验证为 NSEventTypeMagnify，并正确映射 Began/Changed/Ended/Cancelled。没有用快捷键模拟缩放。
+
+识别：跟踪两个 ContactID 的质心与间距。两指平移进入滚动；间距变化超过 max(8 counts, 初始间距的3%)、相对质心平移占优且有连续径向运动时进入捏合。一根手指固定、另一根张开/合拢也可识别；孤立的落板跳变不作为连续捏合。为防止两种事件混发，同一对接触一旦确认滚动或缩放便锁定，抬指后可切换。
+
+缩放：按两指距离比生成相对缩放量，在对数域沿用12ms缓存与显示刷新重采样；张开放大、合拢缩小，与自然滚动方向和指针加速独立。结束时送完余量，抬指发 Ended，按压/换指/第三指/设备移除发 Cancelled。缩放结束后仍在板上的一指暂不驱动指针，避免尾指漂移。物理按压优先，保留食指按住左键、中指拖动的操作。
+
+配置：`TPKB_PINCH=1` 默认开启，0恢复双指仅滚动；`TPKB_PINCH_GAIN=1.0` 调整灵敏度（0.1～4）。目标应用需要支持原生 magnify 事件。
+
+验证：原滚动/指针/轻点测试全部保留；新增正反向缩放比例、反转、单指固定捏合、平移滚动互斥、带重采样滚动距离、相对抖动/孤立跳变、换ContactID/按压/第三指/设备移除取消、尾指不漂移、用户双指按压拖移姿势。另用 AppKit 对生产事件工厂做原生类型/相位/正负缩放量测试。所有测试在 ASan/UBSan 下通过；实机应用兼容性与手感另行验证。
+
+部署后驱动启动、辅助功能授权及 HID 回调正常。30秒实机短时采样记录到15组完整的缩放手势（15 Began、290 Changed、15 Ended），包含正负缩放增量；采样已自动结束。该结果证明硬件手势已走到缩放输出，应用表现与主观灵敏度仍以用户试用为准。
+
+Safari 试用反馈：放大、缩小可用，但合拢不能像内置触控板一样进入标签页概览。已有原生与 DIY 缩放量范围重叠，未据此提高倍率。将捏合注入点从 session 改为 TouchSimulator 使用的 HID 通道后，用户确认仍然只能缩小页面，该调整没有解决概览问题。
+
+进一步在独立诊断进程中加载本机 Safari 框架，核对 `TabContentView -magnifyWithEvent:`：只有 `magnification < 0` 且 `phase == NSEventPhaseBegan` 时才调用 `beginVisualTabPickerTransitionWithEvent:originatingView:`。旧实现先发零增量 Began，再发负增量 Changed，错过这个入口。现改为首笔非零重采样位移携带 Began，其余位移携带 Changed；首次显示刷新前抬指，也会在收尾时先输出带方向的 Began，再发 Ended，不丢失或重复累计缩放量。
+
+验证：新增首帧正负方向、短捏合在显示刷新前抬指时的有序收尾测试；原有缩放比例/滚动/拖移回归及 AppKit 相位解码测试通过。独立 Safari 诊断以替代 controller 拦截概览入口，不创建窗口或操作用户的 Safari：旧的零 Began + 负 Changed 未进入概览入口，负 Began 成功进入，正 Began 不进入。完整界面表现另待实机手势确认。
