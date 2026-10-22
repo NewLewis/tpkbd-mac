@@ -21,7 +21,7 @@ It turns out the touchpad also implements the **standard HID multitouch digitize
 | 2-finger move | Smooth scrolling | Gesture-phase event stream — apps treat it like a real trackpad, not a mouse wheel |
 | 2-finger flick | Momentum scrolling | Physics curve ported from Mac Mouse Fix's trackpad-like defaults |
 | 2-finger pinch / spread | Zoom out / in | Native magnify events in supporting apps; lift and touch again to switch between scrolling and zooming |
-| 2-finger press | Right click | 2-finger *tap*-right-click is off by default (easy to trigger accidentally) — enable with `TPKB_TAP_RIGHT=1` |
+| 2-finger tap / press | Right click | Tap is enabled by default; tracks both contacts and excludes scrolling, zooming, dragging and physical-click duplicates |
 | 3-finger move | Drag / text selection | No press needed; starts at the cursor, releases when fewer than 3 fingers remain; remaining contacts cannot scroll or move the cursor |
 | 4-finger swipe left/right | Switch desktop space / full-screen app | Follows the finger, pull back to cancel |
 | 4-finger swipe up / down | Mission Control / App Exposé | Lift all fingers before starting a drag |
@@ -78,7 +78,7 @@ Everything is an environment variable in the plist — change and `launchctl boo
 | `TPKB_PINCH_GAIN` | 1.0 | Zoom sensitivity (0.1–4); independent of natural scrolling and pointer speed |
 | `TPKB_SCROLL_NATURAL` | 1 | 1 = natural scrolling |
 | `TPKB_TAPCLICK` | 1 | Tap-to-click |
-| `TPKB_TAP_RIGHT` | 0 | 2-finger tap = right click (off by default; 2-finger press is always right click) |
+| `TPKB_TAP_RIGHT` | 1 | 2-finger tap = right click; 0 disables it. The master tap switch also applies; physical 2-finger pressing is independent |
 | `TPKB_DRAG_SLOP` | 12 | Click-time drag slop (sensor counts): movement below this right after a press is swallowed so the press reads as a clean click — screenshot window-picking etc. depend on it; 0 disables |
 | `TPKB_MOVE_SLOP` | 14 | Landing dead zone (sensor counts), ≈ libinput's 1.3 mm tap-move threshold: landing-settle shifts don't move the cursor and don't cancel taps; crossing it releases tracking with the full distance replayed |
 | `TPKB_TAP_MS` | 250 | Max tap duration (ms) |

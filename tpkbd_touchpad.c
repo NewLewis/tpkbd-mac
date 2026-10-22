@@ -61,6 +61,7 @@
 #include "two_finger_gesture.h"
 #include "magnify_event.h"
 #include "three_finger_drag.h"
+#include "two_finger_tap.h"
 
 #define VID               0x17ef
 #define PID               0x60b5
@@ -289,9 +290,10 @@ static int click_count_for(CGPoint pos) {
 
 // ---- 轻点点按 & 双指右键 ----
 // 轻点 = 短触摸(<TPKB_TAP_MS) + 位移小 + 未产生滚动像素; 单指轻点 → 左键。
-// 双指轻点 → 右键默认关(易误触, TPKB_TAP_RIGHT=1 打开); 双指物理按压始终是右键。
+// 双指轻点独立跟踪两个 ContactID, 与滚动/捏合/拖移及物理按压互斥。
 static int      tap_on = 1;            // TPKB_TAPCLICK
-static int      tap_right_on = 0;      // TPKB_TAP_RIGHT: 双指轻点=右键(默认关)
+static int      tap_right_on = 1;      // TPKB_TAP_RIGHT: 双指轻点=右键
+static TwoFingerTap two_finger_tap;
 static int      tap_ms_thresh = 250;   // TPKB_TAP_MS
 static int      tap_nfid = 0;          // 本轮触摸的峰值指数
 static int      tap_moved = 0;         // 主指位移超阈值
@@ -626,6 +628,7 @@ static uint64_t touch_scroll_time(uint64_t received_ns, uint16_t scan) {
 }
 
 static void touch_scroll_push(double dx, double dy, uint64_t ns) {
+    if (dx || dy) two_finger_tap_cancel(&two_finger_tap);
     if (touch_resampling) scroll_resampler_push(&touch_resampler, ns, dx, dy);
     else post_gesture_scroll(dx, dy);
 }
@@ -688,6 +691,7 @@ static void pinch_tick(uint64_t ns) {
 
 static void pinch_begin(CGPoint location, double initial_distance,
                         uint64_t initial_ns, uint64_t ns, uint16_t scan) {
+    two_finger_tap_cancel(&two_finger_tap);
     pinch_active = 1;
     pinch_sent = 0;
     pinch_tail = 0;
@@ -1525,6 +1529,17 @@ static void handle_report(uint32_t cb_rid, uint8_t *r, CFIndex len) {
         }
     }
 
+    // Observe every report, including staggered releases and reports later
+    // consumed by another gesture. Only an uninterrupted pair of short,
+    // stationary contacts may become a secondary tap.
+    TapContact tap_contacts[NFINGER];
+    int tap_count = 0;
+    for (int i = 0; i < NFINGER; i++) if (tips[i])
+        tap_contacts[tap_count++] = (TapContact){contact_id[i], fx[i], fy[i]};
+    int right_tap = two_finger_tap_update(&two_finger_tap, tap_contacts, tap_count, now_ms(),
+        tap_on && tap_right_on && !swallow && !click && !btn_prev && !rel_btn_prev && !tap_pointer_moved,
+        move_slop, tap_ms_thresh);
+
     // 惯性滚动中: 任何新接触或物理按压都立即截停(同 macOS 触控板行为)
     if (mom_active && (ntips > 0 || click)) mom_stop();
 
@@ -1648,24 +1663,20 @@ static void handle_report(uint32_t cb_rid, uint8_t *r, CFIndex len) {
         scroll_active = 0;
         two_finger.mode = TWO_NONE;
 
-        // ---- 轻点点按判定 (抬指时回溯评估) ----
-        // 条件: 时长<阈值 + 两轴位移均在 move_slop 内 + 未移动光标/滚动。
-        // 双指滚动哪怕只滚了 1px(gesture_state 到过 2), 两指轻点即作废,
-        // 否则轻蹭一下就会弹右键菜单。
-        if (tap_active && tap_on && btn_prev == 0 &&
-            (tap_nfid == 1 || (tap_nfid == 2 && tap_right_on)) && !tap_moved && !tap_pointer_moved &&
+        // 双指右键由独立触点状态判断; 单指左键沿用已验证的落板防漂移
+        // 与连击判定。右键资格在接收滚动/捏合输入时已永久取消, 不依赖
+        // 此处可能被收尾复位的 gesture_state 或尚未输出的重采样像素。
+        if (right_tap) {
+            post_right_click(cur, 1, 1);
+            post_right_click(cur, 0, 1);
+            if (debug) fprintf(stderr, "[tpkbd] TAP right\n");
+        } else if (tap_active && tap_on && btn_prev == 0 && tap_nfid == 1 && !tap_moved && !tap_pointer_moved &&
             !tap_scrolled &&
             now_ms() - tap_down_ms < (uint64_t)tap_ms_thresh) {
-            if (tap_nfid == 1) {
-                int c = click_count_for(cur);
-                post_click(cur, 1, c);
-                post_click(cur, 0, c);
-                if (debug) fprintf(stderr, "[tpkbd] TAP left count=%d\n", c);
-            } else {
-                post_right_click(cur, 1, 1);
-                post_right_click(cur, 0, 1);
-                if (debug) fprintf(stderr, "[tpkbd] TAP right\n");
-            }
+            int c = click_count_for(cur);
+            post_click(cur, 1, c);
+            post_click(cur, 0, c);
+            if (debug) fprintf(stderr, "[tpkbd] TAP left count=%d\n", c);
         }
         tap_active = 0; tap_nfid = 0; tap_moved = 0;
         type_grandf = 0;   // 在板手势结束, 后续新触摸按锁定规则处理
@@ -2034,6 +2045,7 @@ static void device_detached(void *context, IOReturn result,
                             void *sender, IOHIDDeviceRef device) {
     (void)context; (void)result; (void)sender; (void)device;
     release_pointer_buttons();
+    two_finger_tap = (TwoFingerTap){0};
     swipe3_end(1);
     system_swipe_tail = 0;
     pinch_finish(1);
@@ -2119,6 +2131,8 @@ int main(int argc, char **argv) {
             pinch_on ? "开" : "关", pinch_gain);
     fprintf(stderr, "[tpkbd] 三指拖移=%s, 桌面手势=%s (%d指)\n",
             drag3_on ? "开" : "关", swipe3_on ? "开" : "关", drag3_on ? 4 : 3);
+    fprintf(stderr, "[tpkbd] 轻点: 单指左键=%s, 双指右键=%s (独立触点跟踪/手势互斥)\n",
+            tap_on ? "开" : "关", tap_on && tap_right_on ? "开" : "关");
     scroll_frames_init();
     hid_api_init();
     update_display_bounds();

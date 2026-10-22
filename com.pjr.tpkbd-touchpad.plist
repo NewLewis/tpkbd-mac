@@ -32,6 +32,8 @@
 		<string>1</string>
 		<key>TPKB_SWIPE3</key>
 		<string>1</string>
+		<key>TPKB_TAP_RIGHT</key>
+		<string>1</string>
 		<key>TPKB_TAP</key>
 		<string>session</string>
 		<key>TPKB_DEBUG</key>

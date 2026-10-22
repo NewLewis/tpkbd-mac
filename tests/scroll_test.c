@@ -89,6 +89,7 @@ static void reset(void) {
     gesture_state = scroll_active = have_last = btn_prev = 0;
     scroll_lift_ms = 0;
     tap_active = tap_nfid = tap_moved = 0;
+    tap_right_on = 1; two_finger_tap = (TwoFingerTap){0};
     memset(tip_state, 0, sizeof(tip_state));
     memset(down_seq, 0, sizeof(down_seq));
     disable_rel = 1; tap_on = 0; typelock_ms = 0; swipe3_on = 0;
@@ -829,7 +830,139 @@ static void four_finger_swiping(void) {
     assert(mouse_count == 0 && sample_count == 0 && !system_swipe_tail);
 }
 
+static void assert_right_tap(void) {
+    assert(mouse_count == 2);
+    assert(mouse_samples[0].type == kCGEventRightMouseDown);
+    assert(mouse_samples[1].type == kCGEventRightMouseUp);
+    assert(test_cursor.x == 500 && test_cursor.y == 500);
+}
+
+static int right_clicks(void) {
+    int result = 0;
+    for (int i = 0; i < mouse_count; i++) result += mouse_samples[i].type == kCGEventRightMouseDown;
+    return result;
+}
+
+static void begin_two_tap(void) {
+    for (int i = 0; i < 3; i++) pair_report(400, 400, 600, 400, 3, 0, 1);
+}
+
+static void two_finger_tapping(void) {
+    for (int tail = 0; tail <= 2; tail++) {
+        reset(); tap_on = tap_right_on = pinch_on = drag3_on = swipe3_on = 1;
+        pair_report(400, 400, 600, 400, 3, 0, 1);
+        pair_report(400, 400, 600, 400, 3, 0, 1);
+        pair_report(400, 400, 600, 400, 3, 0, 1);
+        if (tail) pair_report(400, 400, 600, 400, tail, 0, 1);
+        pair_report(400, 400, 600, 400, 0, 0, 1);
+        assert_right_tap();
+    }
+
+    // Fingers may land in either order or change report slots; each identity
+    // keeps its own anchor instead of inheriting another finger's position.
+    for (int first = 1; first <= 2; first++) {
+        reset(); tap_on = tap_right_on = pinch_on = 1;
+        pair_report(400, 400, 600, 400, first, 0, 1);
+        begin_two_tap();
+        pair_report(401, 401, 599, 399, 3, 0, 1); // Small opposing jitter, stationary centroid.
+        pair_report(400, 400, 600, 400, 0, 0, 1);
+        assert_right_tap();
+    }
+    reset(); tap_on = tap_right_on = pinch_on = 1;
+    begin_two_tap();
+    DragContact swapped[] = {{1,600,400},{0,400,400}};
+    contacts_report(swapped, 2, 0); contacts_report(NULL, 0, 0);
+    assert_right_tap();
+
+    // Movement of the second finger alone invalidates the tap, even when an
+    // isolated jump has not been classified as pinch or scroll.
+    reset(); tap_on = tap_right_on = pinch_on = 1;
+    begin_two_tap();
+    pair_report(400, 400, 630, 400, 3, 0, 1);
+    pair_report(400, 400, 630, 400, 3, 0, 1);
+    pair_report(400, 400, 630, 400, 0, 0, 1);
+    assert(right_clicks() == 0);
+
+    // Scroll recognition remains sticky across delayed output and a one-finger
+    // tail that has already reset gesture_state before the final lift.
+    for (int buffered = 0; buffered < 2; buffered++) {
+        reset(); tap_on = tap_right_on = pinch_on = 1;
+        scroll_smooth_ms = buffered ? 12 : 0;
+        begin_two_tap();
+        pair_report(400, 402, 600, 402, 3, 0, 1);
+        if (!buffered) for (int i = 0; i < 10; i++) pair_report(400, 402, 600, 402, 1, 0, 1);
+        pair_report(400, 402, 600, 402, 0, 0, 1);
+        assert(right_clicks() == 0);
+    }
+    reset(); tap_on = tap_right_on = pinch_on = 1; scroll_smooth_ms = 12;
+    begin_two_tap();
+    for (int i = 1; i <= 3; i++) pair_report(400 + i * 2, 400, 600 - i * 2, 400, 3, 0, 1);
+    pair_report(406, 400, 594, 400, 0, 0, 1);
+    assert(pinch_count > 0 && right_clicks() == 0);
+
+    // A physical right click is exactly one click, even if the button releases
+    // and finishes its debounce before the two stationary contacts lift.
+    reset(); tap_on = tap_right_on = pinch_on = 1;
+    begin_two_tap();
+    pair_report(400, 400, 600, 400, 3, 1, 1);
+    for (int i = 0; i < 6; i++) pair_report(400, 400, 600, 400, 3, 0, 1);
+    pair_report(400, 400, 600, 400, 0, 0, 1);
+    assert_right_tap();
+
+    // Neither partial lift from a three/four-finger gesture nor a brief phantom
+    // second contact, replaced identity or re-touch may become a secondary tap.
+    for (int fingers = 3; fingers <= 4; fingers++) {
+        reset(); tap_on = tap_right_on = pinch_on = drag3_on = swipe3_on = 1;
+        begin_two_tap(); group_report(fingers, 0, 0, 0);
+        begin_two_tap(); pair_report(400, 400, 600, 400, 0, 0, 1);
+        assert(right_clicks() == 0);
+    }
+    for (int invalid = 0; invalid < 7; invalid++) {
+        reset(); tap_on = tap_right_on = pinch_on = 1;
+        if (invalid == 0) {
+            pair_report(400, 400, 600, 400, 1, 0, 1);
+            pair_report(400, 400, 600, 400, 3, 0, 1); // Only one paired report.
+        } else {
+            if (invalid == 1) {
+                pair_report(400, 400, 600, 400, 1, 0, 1);
+                test_time_ms += 90; // Second finger arrives too late.
+            }
+            begin_two_tap();
+            if (invalid == 2) {
+                pair_report(400, 400, 600, 400, 1, 0, 1);
+                test_time_ms += 90;
+                pair_report(400, 400, 600, 400, 1, 0, 1); // Final release too late.
+            }
+            if (invalid == 3) {
+                pair_report(400, 400, 600, 400, 1, 0, 1);
+                pair_report(400, 400, 600, 400, 3, 0, 1); // A lifted finger returns.
+            }
+            if (invalid == 4) pair_report(400, 400, 600, 400, 3, 0, 2);
+            if (invalid == 5) for (int i = 0; i < 40; i++) pair_report(400, 400, 600, 400, 3, 0, 1);
+            if (invalid == 6) device_detached(NULL, 0, NULL, NULL);
+        }
+        pair_report(400, 400, 600, 400, 0, 0, 1);
+        assert(right_clicks() == 0);
+    }
+
+    // The optional right-tap switch, master tap switch, typing lock and the
+    // old scroll-only mode all remain compatible with the new recognizer.
+    for (int disabled = 0; disabled < 3; disabled++) {
+        reset(); tap_on = tap_right_on = pinch_on = 1;
+        if (disabled == 0) tap_right_on = 0;
+        if (disabled == 1) tap_on = 0;
+        if (disabled == 2) { typelock_ms = 20; last_key_ms = now_ms(); }
+        begin_two_tap();
+        pair_report(400, 400, 600, 400, 0, 0, 1);
+        assert(right_clicks() == 0);
+    }
+    reset(); tap_on = tap_right_on = 1; pinch_on = 0;
+    begin_two_tap(); pair_report(400, 400, 600, 400, 0, 0, 1);
+    assert_right_tap();
+}
+
 int main(void) {
+    two_finger_tapping();
     three_finger_dragging();
     four_finger_swiping();
     pinch_gestures();
@@ -842,6 +975,6 @@ int main(void) {
     staggered_lift();
     resampler_cadence();
     resampled_gesture();
-    puts("PASS: three-finger drag/selection/button ownership/identity/fractions/typing/release, four-finger swipes/arbitration/tails/legacy mode, pinch ratios/phases/arbitration/jitter/contact changes/drag priority, pointer fractions/velocity curve/cadence/reversal/edges, tap boundaries/no drift, multi-click, movement cancellation/drag, slow scroll precision, fractional fields, distance/direction, time-based velocity, pause/reversal, momentum phases/distance, staggered lift, 60/75/120Hz resampling, USB jitter, scan clock wrap, flush/no drift");
+    puts("PASS: two-finger tap/independent identities/overlap/timing/gesture exclusion/physical-click exclusion, three-finger drag/selection/button ownership/identity/fractions/typing/release, four-finger swipes/arbitration/tails/legacy mode, pinch ratios/phases/arbitration/jitter/contact changes/drag priority, pointer fractions/velocity curve/cadence/reversal/edges, tap boundaries/no drift, multi-click, movement cancellation/drag, slow scroll precision, fractional fields, distance/direction, time-based velocity, pause/reversal, momentum phases/distance, staggered lift, 60/75/120Hz resampling, USB jitter, scan clock wrap, flush/no drift");
     return 0;
 }
